@@ -1,0 +1,12 @@
+{
+  "source_pdf": "/data1/lai/algorithm-python/xhy/tcm-extract-engine/workspace/books/637bb343ae75/00_source/样例手册.md",
+  "source_sha256": "sha256:637bb343ae756eeddf1d45bf43b601195cddaaafa604e0429ed6dffd85eb4f70",
+  "blocks_builder_version": "2026-09-08.preserve-layout-content-v2",
+  "doc_id": "doc-637bb343ae756eeddf1d45bf43b60119",
+  "parser": "markdown-direct",
+  "cache_key": "/data1/lai/algorithm-python/xhy/tcm-extract-engine/workspace/books/637bb343ae75/00_source/样例手册.md",
+  "parsed_dir": "/data1/lai/algorithm-python/xhy/tcm-extract-engine/workspace/books/637bb343ae75/00_source/__parsed__/样例手册.md.parsed",
+  "blocks_path": "/data1/lai/algorithm-python/xhy/tcm-extract-engine/workspace/books/637bb343ae75/00_source/__parsed__/样例手册.md.parsed/样例手册.blocks.jsonl",
+  "content_blocks": 5,
+  "created_at": "2026-09-20T07:37:47.227989+00:00"
+}

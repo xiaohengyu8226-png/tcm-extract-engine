@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>中医智能审方系统 · 逐步控制抽取</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --line:#e5e9f0; --pri:#2563eb; --muted:#8a94a6; --ok:#16a34a; --warn:#d97706; --err:#dc2626; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:#1f2937; }
+  header { padding:22px 32px 0; }
+  h1 { font-size:22px; margin:0; display:inline-block; }
+  .sub { color:var(--muted); font-size:13px; margin-left:12px; }
+  .tabs { display:flex; gap:26px; margin-top:18px; border-bottom:1px solid var(--line); }
+  .tab { padding:10px 2px; font-size:14px; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
+  .tab.active { color:var(--pri); border-bottom-color:var(--pri); font-weight:600; }
+  main { max-width:1100px; margin:0 auto; padding:22px 32px 60px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:18px; box-shadow:0 1px 2px rgba(0,0,0,.03); }
+  .card h2 { font-size:16px; margin:0 0 4px; } .card .hint{ color:var(--muted); font-size:12px; margin-bottom:14px; }
+  .drop { border:2px dashed #cbd5e1; border-radius:10px; padding:34px; text-align:center; color:var(--muted); cursor:pointer; }
+  .drop.over { border-color:var(--pri); background:#eff6ff; }
+  .btn { border:1px solid var(--line); background:#fff; color:#374151; border-radius:8px; padding:7px 14px; font-size:13px; cursor:pointer; text-decoration:none; display:inline-block; }
+  .btn:hover { border-color:var(--pri); color:var(--pri); }
+  .btn-primary { background:var(--pri); color:#fff; border-color:var(--pri); }
+  .btn-primary:hover { opacity:.9; color:#fff; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .job { border:1px solid var(--line); border-radius:10px; padding:12px 16px; margin-bottom:10px; cursor:pointer; }
+  .job:hover { border-color:var(--pri); }
+  .job.sel { border-color:var(--pri); box-shadow:0 0 0 2px #dbeafe; }
+  .job .top { display:flex; justify-content:space-between; align-items:center; }
+  .job .name { font-weight:600; } .job .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .job .msg { color:var(--muted); font-size:12px; margin-top:2px; }
+  .badge { font-size:12px; padding:3px 10px; border-radius:999px; background:#eef2ff; color:var(--pri); }
+  .badge.done{ background:#dcfce7; color:var(--ok);} .badge.run{ background:#fef3c7; color:var(--warn);} .badge.err{ background:#fee2e2; color:var(--err);}
+  /* stepper（对齐 tcm-rag-bak 视觉语言） */
+  .stepper { display:flex; align-items:center; gap:4px; margin:4px 0 18px; flex-wrap:wrap; }
+  .stepper .step { display:flex; align-items:center; gap:6px; }
+  .stepper .step-dot { width:28px; height:28px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+    border:2px solid var(--line); background:#f8f9fa; color:var(--muted); font-size:13px; font-weight:600; }
+  .stepper .step-dot.done { background:#e6f4ea; color:var(--ok); border-color:var(--ok); }
+  .stepper .step-dot.current { background:#e8f0fe; color:var(--pri); border-color:var(--pri); box-shadow:0 0 0 3px #dbeafe; }
+  .stepper .step-label { font-size:12px; color:var(--muted); }
+  .stepper .step-label.current { color:var(--pri); font-weight:600; }
+  .stepper .step-line { flex:0 0 22px; height:2px; background:var(--line); }
+  .stepper .step-line.done { background:var(--ok); }
+  .model-tag { display:inline-block; min-width:16px; padding:1px 5px; margin-left:4px; border-radius:4px; color:#fff; font-size:11px; text-align:center; }
+  .mt-c{background:#7c3aed;} .mt-a{background:#2563eb;} .mt-b{background:#16a34a;}
+  .workflow-msg { padding:12px 16px; border-radius:8px; margin:12px 0; font-size:14px; }
+  .workflow-msg.info { background:#e8f0fe; color:var(--pri); }
+  .workflow-msg.success { background:#e6f4ea; color:var(--ok); }
+  .workflow-msg.warn { background:#fef7e0; color:#8a5a00; }
+  .workflow-msg.error { background:#fce8e6; color:var(--err); }
+  .workflow-actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+  .model-panel { border:1px solid var(--line); border-radius:8px; padding:10px 14px; margin-bottom:12px; background:#f8f9fa; }
+  .model-panel .mn { font-size:13px; font-weight:600; } .model-panel .md { font-size:12px; color:var(--muted); margin-top:2px; }
+  .model-panel .cfg { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  .model-panel .cfg span { font-size:11px; background:#eef2ff; color:var(--pri); border-radius:4px; padding:1px 7px; }
+  .box { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:12px; }
+  .box h4 { font-size:13px; font-weight:600; margin:0 0 8px; }
+  .fold { cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
+  .fold .arr { font-size:10px; color:var(--muted); }
+  pre { background:#0f172a; color:#e2e8f0; border-radius:8px; padding:14px; overflow:auto; max-height:360px; font-size:12px; line-height:1.5; }
+  table { width:100%; border-collapse:collapse; font-size:12px; } th,td { border:1px solid var(--line); padding:6px 8px; text-align:left; }
+  th { background:#f8fafc; }
+  .empty { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
+  .prog { font-size:12px; color:var(--warn); }
+  .stats { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; margin:12px 0; }
+  .stats .st { background:#f8f9fa; border-radius:8px; padding:12px 6px; text-align:center; }
+  .stats .v { font-size:20px; font-weight:700; } .stats .l { font-size:12px; color:var(--muted); margin-top:2px; }
+  .cols { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .tabs2 { display:flex; gap:18px; border-bottom:1px solid var(--line); margin:10px 0; }
+  .tabs2 span { padding:8px 2px; font-size:13px; color:var(--muted); cursor:pointer; border-bottom:2px solid transparent; }
+  .tabs2 span.on { color:var(--pri); border-bottom-color:var(--pri); font-weight:600; }
+  select { font-size:12px; padding:3px 6px; border:1px solid var(--line); border-radius:6px; background:#fff; max-width:180px; }
+  .inp { font-size:12px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; width:160px; }
+  code { background:#f1f5f9; padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>中医智能审方系统</h1>
+  <span class="sub">PDF 结构化抽取 + 知识建设 · 引擎驱动 BookPipeline</span>
+  <div class="tabs">
+    <div class="tab" onclick="alert('批量抽取请用 CLI：tcm-engine book run <dir>')">批量抽取</div>
+    <div class="tab active">逐步控制抽取 (C/A/B)</div>
+    <div class="tab" onclick="alert('知识审核 / 发布留在 tcm-rag，本引擎不含')">知识审核</div>
+  </div>
+</header>
+<main>
+  <div class="card">
+    <h2>上传文档</h2>
+    <div class="hint">交互式工作流专用 · 支持 PDF / Markdown（Markdown 免 GPU 直转）</div>
+    <div id="drop" class="drop">拖放或点击上传 PDF / Markdown 文件<br><button class="btn" style="margin-top:12px">选择文件</button></div>
+    <input id="file" type="file" accept=".pdf,.md,.markdown" style="display:none" multiple />
+  </div>
+
+  <div class="card">
+    <h2>交互式任务</h2>
+    <div class="hint">点击任务进入工作流 · 进度以 manifest 为权威状态，服务重启自动恢复</div>
+    <div id="jobs"><div class="empty">暂无任务，请先上传文档</div></div>
+  </div>
+
+  <div class="card" id="wfCard" style="display:none">
+    <h2 id="wfTitle">工作流</h2>
+    <div class="stepper" id="stepper"></div>
+    <div id="panel"></div>
+  </div>
+
+  <div class="card" id="gepaCard">
+    <h2>自优化飞轮 · GEPA</h2>
+    <div class="hint">离线提示词进化（C 反思→A/B 真实评分）· 与上方抽取流程解耦，仅经「人工晋升」写入 prompts/a/* 受管块并 bump 版本后才影响线上 · <a style="color:var(--pri);cursor:pointer" onclick="loadGepa(true)">刷新</a></div>
+    <div id="gepaBody"><div class="empty">加载中…</div></div>
+  </div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const drop = $("#drop"), fileInput = $("#file");
+drop.onclick = () => fileInput.click();
+fileInput.onchange = () => uploadFiles(fileInput.files);
+["dragover"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", ev => uploadFiles(ev.dataTransfer.files));
+
+async function uploadFiles(files) {
+  for (const f of files) {
+    const form = new FormData(); form.append("file", f);
+    const r = await fetch("/api/upload?interactive=true", { method:"POST", body:form });
+    if (!r.ok) { alert((await r.json()).detail || "上传失败"); continue; }
+    const j = await r.json(); selectJob(j.job_id);
+  }
+  refresh();
+}
+
+// ── 工作流步骤定义（对齐 tcm-rag-bak 逐步控制 tab）──────────────────────────
+const STEPS = [
+  { key:"parse",   label:"解析",     model:null },
+  { key:"prompt",  label:"抽取蓝图", model:"C" },
+  { key:"extract", label:"抽取",     model:"A" },
+  { key:"compare", label:"核对",     model:null },
+  { key:"verify",  label:"校验",     model:"B" },
+  { key:"export",  label:"导出",     model:null },
+];
+// workflow_stage → 当前步骤下标（当前步 = 下一步要动作的步）
+const STEP_IDX = { uploaded:0, parsing:0, parsed:1, generating_prompt:1, prompt_ready:1,
+  extracting:2, extracted:3, verifying:4, verified:5, done:5 };
+const RUNNING = new Set(["parsing","generating_prompt","extracting","verifying"]);
+const STAGE_LABEL = { uploaded:"待解析", parsing:"解析中", parsed:"已解析", generating_prompt:"生成方案中",
+  prompt_ready:"待确认方案", extracting:"抽取中", extracted:"已抽取", verifying:"校验中", verified:"已核验", done:"已完成" };
+const RETRY_LABEL = { parse:"重新解析", prompt:"重新生成蓝图", extract:"重新抽取", verify:"重新校验", export:"重新导出" };
+const STEP_LABEL = Object.fromEntries(STEPS.map(s => [s.key, s.label]));
+
+let jobs = [], current = null, _timer = null, _fast = null;
+
+async function refresh() {
+  const r = await fetch("/api/interactive/jobs"); jobs = await r.json();
+  renderJobs();
+  if (current) {
+    const up = jobs.find(j => j.job_id === current.job_id);
+    if (up) { current = up; renderWorkflow(); }
+  }
+}
+function selectJob(id) { current = jobs.find(j => j.job_id === id) || { job_id:id }; $("#wfCard").style.display = ""; }
+
+function renderJobs() {
+  const box = $("#jobs");
+  if (!jobs.length) { box.innerHTML = '<div class="empty">暂无任务，请先上传文档</div>'; return; }
+  box.innerHTML = "";
+  jobs.forEach(j => {
+    const el = document.createElement("div");
+    el.className = "job" + (current && current.job_id === j.job_id ? " sel" : "");
+    const idx = STEP_IDX[j.workflow_stage] ?? 0;
+    el.innerHTML = `<div class="top"><div><div class="name">${esc(j.filename)}</div>
+      <div class="meta">${j.job_id} · ${j.chunks_count||0} 分块 · ${j.records_count||0} 条记录</div>
+      <div class="msg">${esc(j.message||"")}</div></div>
+      <span class="badge ${badgeClass(j)}">${STAGE_LABEL[j.workflow_stage]||j.workflow_stage} ${idx+1}/6</span></div>`;
+    el.onclick = () => { selectJob(j.job_id); renderJobs(); renderWorkflow(); };
+    box.appendChild(el);
+  });
+}
+function badgeClass(j) {
+  if (j.status === "FAILED") return "err";
+  if (RUNNING.has(j.workflow_stage)) return "run";
+  if (j.workflow_stage === "done" || j.workflow_stage === "verified") return "done";
+  return "";
+}
+
+// ── stepper ────────────────────────────────────────────────────────────────
+function renderStepper(stage) {
+  const cur = STEP_IDX[stage] ?? 0;
+  $("#stepper").innerHTML = STEPS.map((s, i) => {
+    const st = i < cur ? "done" : i === cur ? "current" : "pending";
+    const tag = s.model ? `<span class="model-tag mt-${s.model.toLowerCase()}">${s.model}</span>` : "";
+    const line = i > 0 ? `<div class="step-line ${i <= cur ? "done" : ""}"></div>` : "";
+    const ok = i <= cur;
+    const isBack = i < cur;
+    const click = ok ? ` onclick="stepClick('${s.key}',${isBack})"` : "";
+    const title = ok ? (isBack ? "点击回退查看此步骤（不作废下游）" : "点击执行或重跑此步骤") : "请先完成前序步骤";
+    return `${line}<div class="step" style="cursor:${ok?"pointer":"default"}" title="${title}"${click}>
+      <div class="step-dot ${st}">${st === "done" ? "✓" : i + 1}</div>
+      <span class="step-label ${st === "current" ? "current" : ""}">${s.label}${tag}</span></div>`;
+  }).join("");
+}
+
+// ── 步骤面板 ───────────────────────────────────────────────────────────────
+function modelPanel(model, name, desc, cfg) {
+  const tag = model ? `<span class="model-tag mt-${model.toLowerCase()}">${model}</span> ` : "";
+  return `<div class="model-panel"><div class="mn">${tag}${esc(name)}</div>
+    <div class="md">${esc(desc)}</div>
+    <div class="cfg">${(cfg||[]).map(c=>`<span>${esc(c)}</span>`).join("")}</div></div>`;
+}
+function timerHtml() { return `<div class="prog">已用时 <span id="elapsed">0</span>s</div>`; }
+
+function renderWorkflow() {
+  const j = current; if (!j) return;
+  $("#wfTitle").textContent = "工作流：" + (j.filename || j.job_id);
+  renderStepper(j.workflow_stage);
+  const stage = j.workflow_stage;
+  let html = "";
+  if (stage === "uploaded") {
+    html = `<div class="workflow-msg info">文件已上传，请点击下方按钮开始解析。</div>
+      <div class="workflow-actions"><button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/parse')">开始解析</button></div>`;
+  } else if (stage === "parsing") {
+    html = modelPanel(null, "MinerU 解析引擎", "GPU 加速的 PDF 版面分析 + OCR + 表格识别 + 语义分块", ["pipeline 后端", "modelscope 本地权重"])
+      + `<div class="workflow-msg info">正在解析…</div>` + timerHtml();
+  } else if (stage === "parsed") {
+    html = `<div class="workflow-msg success">解析完成：${j.chunks_count||0} 个分块</div>
+      <div class="workflow-actions">
+        <button class="btn" onclick="showParsed()">查看解析结果</button>
+        <button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/generate-prompt')">自动生成抽取蓝图 <span class="model-tag mt-c">C</span></button>
+      </div><div id="viewBox"></div>`;
+  } else if (stage === "generating_prompt") {
+    html = modelPanel("C", "Model C — 章节画像与规划", "确定性规划：章节切分 → 内容类型判定 → 抽取器/模板路由（无 LLM 漂移）", ["规则路由", "表格优先", "零调用"])
+      + `<div class="workflow-msg info">正在生成抽取蓝图…</div>` + timerHtml();
+  } else if (stage === "prompt_ready") {
+    html = planPanel(j);
+  } else if (stage === "extracting") {
+    html = modelPanel("A", "Model A — 知识抽取模型", "按确认的蓝图逐章节抽取结构化记录（herb_table / general_rule / interaction / pregnancy 模板）", ["Extract LLM", `${j.chunks_count||"?"} chunks`])
+      + `<div class="workflow-msg info">正在调用 Model A 逐章节抽取…</div>` + timerHtml();
+  } else if (stage === "extracted") {
+    html = `<div class="workflow-msg success">抽取完成：${j.records_count||0} 条记录</div>
+      <div class="workflow-actions">
+        <button class="btn" onclick="showCompare()">查看对比（原文 vs 抽取）</button>
+        <button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/verify')">校验核对 <span class="model-tag mt-b">B</span></button>
+      </div><div id="viewBox"></div>`;
+  } else if (stage === "verifying") {
+    html = modelPanel("B", "Model B — 忠实性核验模型", "逐条将抽取记录与原文对照，检测 unsupported / misclassified / dosage 等问题；修正建议进 correction_log 待人工审核", ["Verify LLM", "深度推理"])
+      + `<div class="workflow-msg info">正在确定性校验 + Model B 核验…</div>` + timerHtml();
+  } else if (stage === "verified") {
+    html = `<div class="workflow-msg success">校验完成：${j.verification_issues||0} 个问题</div>
+      <div class="workflow-actions">
+        <button class="btn" onclick="showVerify()">查看 QA 报告</button>
+        <button class="btn btn-primary" onclick="doExport()">导出 Excel</button>
+      </div><div id="viewBox"></div>`;
+  } else if (stage === "done") {
+    html = `<div class="workflow-msg success">导出完成！</div>
+      <div class="workflow-actions">
+        <button class="btn" onclick="showCompare()">查看原文与抽取结果</button>
+        <button class="btn" onclick="showVerify()">查看 QA 报告</button>
+        <a class="btn btn-primary" href="/api/download/${j.job_id}/excel">下载 Excel</a>
+      </div><div id="viewBox"></div>`;
+  }
+  if (j.status === "FAILED") {
+    html = `<div class="workflow-msg error">步骤失败：${esc(j.message||j.error||"未知错误")}</div>` + html;
+  }
+  html += controls(stage);
+  // 仅当「任务+步骤+状态」变化时才整体重建面板；否则定时轮询会重置 #viewBox，
+  // 把用户打开的对比 / QA 报告 / 解析结果等内嵌视图冲掉（表现为“过一会儿自己退出”）
+  const panel = $("#panel");
+  const key = `${j.job_id}|${stage}|${j.status || ""}`;
+  if (panel.dataset.renderKey !== key) { panel.innerHTML = html; panel.dataset.renderKey = key; }
+  managePolling();
+}
+
+function planPanel(j) {
+  const confirmed = j.prompt_confirmed;
+  return `<div id="planBox"><div class="workflow-msg info">蓝图加载中…</div></div>
+    <div class="workflow-actions" style="padding:12px;background:#f8f9fa;border-radius:8px">
+      <button class="btn" onclick="post('/api/jobs/${j.job_id}/step/generate-prompt')">重新生成蓝图</button>
+      ${confirmed
+        ? `<span class="badge done">方案已确认</span><button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/extract')">开始抽取 <span class="model-tag mt-a">A</span></button>`
+        : `<button class="btn btn-primary" onclick="confirmPlan()">确认方案，允许抽取</button>`}
+    </div><div id="viewBox"></div>`;
+}
+async function loadPlan() {
+  const j = current; if (!j || j.workflow_stage !== "prompt_ready") return;
+  const box = $("#planBox"); if (!box || box.dataset.loaded) return;
+  const s = await (await fetch(`/api/jobs/${j.job_id}/schema`)).json();
+  box.dataset.loaded = "1";
+  const extOpts = (s.available_extractors||[]).map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join("");
+  const tplOpts = (s.available_templates||[]).map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join("");
+  const rows = (s.editable_sections||[]).map(x => {
+    const sid = esc(x.section_id);
+    const curExt = (s.available_extractors||[]).includes(x.extractor) ? "" : `<option value="${esc(x.extractor)}" selected>${esc(x.extractor)||"（空）"}</option>`;
+    const curTpl = (s.available_templates||[]).includes(x.template) ? "" : `<option value="${esc(x.template)}" selected>${esc(x.template)||"（空）"}</option>`;
+    return `<tr data-sid="${sid}">
+      <td title="${esc(x.title)}">${esc((x.title||"").slice(0,26))}</td>
+      <td><select class="pl-ext" ${x.skip?"disabled":""}>${curExt}<option value="">（不抽取）</option>${extOpts}</select></td>
+      <td><select class="pl-tpl" ${x.skip?"disabled":""}>${curTpl}<option value="">（无）</option>${tplOpts}</select></td>
+      <td style="text-align:center"><input type="checkbox" class="pl-skip" ${x.skip?"checked":""}></td></tr>`;
+  }).join("");
+  box.innerHTML = modelPanel("C", "书籍抽取蓝图（可编辑）", "章节 → 抽取器 / A 模板路由可人工调整；保存后重写 plan 产物。", [`${s.total_sections} 章节`, `${s.planned_sections} 可抽取`, esc(s.book_type||"")])
+    + `<div class="box"><h4>章节路由编辑</h4>
+      <table><tr><th>章节</th><th>抽取器</th><th>A 模板</th><th>跳过</th></tr>${rows||'<tr><td colspan=4>无章节</td></tr>'}</table>
+      <div class="workflow-actions"><button class="btn btn-primary" onclick="savePlan()">保存蓝图编辑</button>
+      <span class="hint">勾选「跳过」= 该章节不抽取；已确认且抽过取的书保存后下游记录作废，需重新抽取</span></div></div>
+    <div class="box fold" onclick="togglePrompt()"><h4 style="margin:0">所选 A 模板正文（只读）</h4><span class="arr" id="promptArr">▶</span></div>
+    <div id="promptBody" style="display:none"></div>
+    ${(s.qa_rules||[]).length ? `<p class="hint">风险提示：${s.qa_rules.map(esc).join("；")}</p>` : ""}`;
+  // 跳过勾选联动禁用下拉；下拉选中值回填（当前值不在选项列表时补 option 已 selected）
+  box.querySelectorAll(".pl-skip").forEach(cb => cb.onchange = () => {
+    const tr = cb.closest("tr");
+    tr.querySelectorAll("select").forEach(sel => { sel.disabled = cb.checked; });
+    if (!cb.checked) { // 取消跳过时清掉「（不抽取）/（无）」占位选中
+      tr.querySelectorAll("select").forEach(sel => { if (!sel.value) sel.selectedIndex = 1; });
+    }
+  });
+  box.querySelectorAll("select").forEach(sel => { if (sel.dataset.init) return; sel.dataset.init="1"; });
+  // 回填当前路由值
+  (s.editable_sections||[]).forEach(x => {
+    const tr = box.querySelector(`tr[data-sid="${CSS.escape(x.section_id)}"]`); if (!tr) return;
+    const e = tr.querySelector(".pl-ext"), t = tr.querySelector(".pl-tpl");
+    if (x.extractor) e.value = x.extractor;
+    if (x.template) t.value = x.template;
+  });
+}
+async function savePlan() {
+  const j = current; if (!j) return;
+  const box = $("#planBox");
+  const sections = [...box.querySelectorAll("tr[data-sid]")].map(tr => ({
+    section_id: tr.dataset.sid,
+    extractor: tr.querySelector(".pl-ext").value,
+    template: tr.querySelector(".pl-tpl").value,
+    skip: tr.querySelector(".pl-skip").checked,
+  }));
+  if (!confirm("保存蓝图编辑？已确认且抽过取的书，下游抽取/校验记录将被作废（产物保留）。")) return;
+  const r = await fetch(`/api/jobs/${j.job_id}/schema`, {
+    method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ sections }),
+  });
+  if (!r.ok) { alert((await r.json().catch(()=>({}))).detail || "保存失败"); return; }
+  box.dataset.loaded = "";
+  await refresh();
+}
+async function togglePrompt() {
+  const body = $("#promptBody"); if (!body) return;
+  if (body.style.display === "none") {
+    body.style.display = ""; $("#promptArr").textContent = "▼";
+    if (!body.dataset.loaded) {
+      body.innerHTML = '<div class="workflow-msg info">加载中…</div>';
+      const d = await (await fetch(`/api/jobs/${current.job_id}/prompt`)).json();
+      body.innerHTML = `<div class="hint">${esc(d.note)}</div><pre>${esc(d.prompt)}</pre>`;
+      body.dataset.loaded = "1";
+    }
+  } else { body.style.display = "none"; $("#promptArr").textContent = "▶"; }
+}
+
+function controls(stage) {
+  const keyByStage = { parsed:"parse", prompt_ready:"prompt", extracted:"extract", verified:"verify", done:"export" };
+  const key = keyByStage[stage]; if (!key) return "";
+  const cmp = stage === "extracted" ? `<button class="btn" onclick="showCompare()">重新核对</button>` : "";
+  return `<div class="workflow-actions" style="margin-top:10px">
+    <button class="btn" onclick="stepClick('${key}')">${RETRY_LABEL[key]}</button>${cmp}
+    <button class="btn" onclick="goBack()">返回上一步</button></div>`;
+}
+
+// ── 动作 ──────────────────────────────────────────────────────────────────
+async function stepClick(key, isBack) {
+  const j = current; if (!j) return;
+  if (key === "compare") { showCompare(); return; }
+  if (key === "export") { doExport(); return; }
+  // 点击更早的步骤节点 = 仅回退查看该步（无损：阶段记录与产物全部保留）
+  if (isBack) {
+    if (!confirm(`跳转到「${STEP_LABEL[key] || key}」查看？仅回退当前步骤，已有阶段记录与产物全部保留；点「重新X」才会作废并重跑。`)) return;
+    await post(`/api/jobs/${j.job_id}/workflow/goto-${key}`);
+    return;
+  }
+  // 点击当前步骤节点 = 执行 / 重跑该步（作废该步及下游记录后重新生成）
+  if (!confirm(`${RETRY_LABEL[key]}？该步骤及下游的阶段记录将被作废并重新生成（产物文件保留可回看）。`)) return;
+  await post(`/api/jobs/${j.job_id}/workflow/retry-${key}`);
+}
+async function goBack() {
+  const j = current; if (!j) return;
+  if (!confirm("返回上一步？仅回退步骤状态，已有阶段记录与产物全部保留；点「重新X」才会作废并重跑。")) return;
+  await post(`/api/jobs/${j.job_id}/workflow/back`);
+}
+async function doExport() {
+  const j = current; if (!j) return;
+  const r = await fetch(`/api/jobs/${j.job_id}/step/export`, { method:"POST" });
+  if (!r.ok) { alert((await r.json().catch(()=>({}))).detail || "导出失败"); return; }
+  await refresh();
+}
+async function confirmPlan() {
+  const j = current; if (!j) return;
+  await post(`/api/jobs/${j.job_id}/prompt`, "PUT");
+}
+async function post(url, method="POST") {
+  const r = await fetch(url, { method });
+  if (!r.ok) { alert((await r.json().catch(()=>({}))).detail || "操作失败"); }
+  await refresh();
+}
+
+// ── 内嵌视图 ───────────────────────────────────────────────────────────────
+function openView(html) {
+  const box = $("#viewBox"); if (!box) return;
+  box.innerHTML = html; box.scrollIntoView({ behavior:"smooth", block:"nearest" });
+}
+async function showParsed() {
+  openView('<div class="workflow-msg info">加载中…</div>');
+  const d = await (await fetch(`/api/jobs/${current.job_id}/parsed`)).json();
+  openView(`<div class="box"><h4>解析结果 · ${d.chunks_count} 个内容块</h4><pre>${esc(d.text)}</pre></div>`);
+}
+async function showCompare() {
+  openView('<div class="workflow-msg info">加载中…</div>');
+  const r = await fetch(`/api/jobs/${current.job_id}/compare`);
+  if (!r.ok) { openView(`<div class="workflow-msg error">${esc((await r.json()).detail||"加载失败")}</div>`); return; }
+  const d = await r.json();
+  const recs = (d.records||[]).map(r2 => `<tr><td>${esc(r2.record_id)}</td><td>${esc(r2.record_type)}</td>
+    <td>${esc(r2.herb_name||r2.subject_text||"")}</td><td>${esc((r2.raw_text||"").slice(0,80))}</td></tr>`).join("");
+  openView(`<div class="box"><h4>对比核对：${(d.records||[]).length} 条记录 / ${(d.chunks||[]).length} 个原文块</h4>
+    <table><tr><th>记录ID</th><th>类型</th><th>主体</th><th>原文片段</th></tr>${recs||'<tr><td colspan=4>无记录</td></tr>'}</table></div>`);
+}
+let _qa = null; // 当前 QA 报告缓存
+async function showVerify() {
+  openView('<div class="workflow-msg info">加载中…</div>');
+  const r = await fetch(`/api/jobs/${current.job_id}/verification`);
+  if (!r.ok) { openView(`<div class="workflow-msg error">${esc((await r.json()).detail||"加载失败")}</div>`); return; }
+  _qa = await r.json();
+  const d = _qa, st = d.stats || {};
+  const cards = [
+    [st.total ?? d.total, "总记录", "var(--pri)"],
+    [((st.pass_rate ?? 1) * 100).toFixed(1) + "%", "通过率", "var(--ok)"],
+    [d.error_count, "ERROR", "var(--err)"],
+    [d.warning_count, "WARNING", "var(--warn)"],
+    [st.correction_count ?? 0, "纠错建议", "var(--warn)"],
+    [st.applied_count ?? 0, "已应用", "var(--ok)"],
+  ].map(c => `<div class="st"><div class="v" style="color:${c[2]}">${c[0]}</div><div class="l">${c[1]}</div></div>`).join("");
+  openView(`<div class="box"><h4>QA 报告</h4>
+    <div class="stats">${cards}</div>
+    <div class="tabs2">
+      <span class="on" data-t="issues" onclick="qaTab('issues')">问题列表 (${(d.issues||[]).length})</span>
+      <span data-t="compare" onclick="qaTab('compare')">校验对照（原文 vs 记录）</span>
+      <span data-t="corr" onclick="qaTab('corr')">纠错建议 (${(d.corrections||[]).length})</span>
+    </div>
+    <div id="qaIssues"></div><div id="qaCompare" style="display:none"></div><div id="qaCorr" style="display:none"></div>
+  </div>`);
+  qaTab("issues");
+}
+function qaTab(t) {
+  document.querySelectorAll(".tabs2 span").forEach(s => s.classList.toggle("on", s.dataset.t === t));
+  $("#qaIssues").style.display = t === "issues" ? "" : "none";
+  $("#qaCompare").style.display = t === "compare" ? "" : "none";
+  $("#qaCorr").style.display = t === "corr" ? "" : "none";
+  if (t === "issues") renderQaIssues();
+  if (t === "compare") renderQaCompare();
+  if (t === "corr") renderQaCorr();
+}
+function renderQaIssues() {
+  const iss = (_qa.issues||[]).map(i => `<tr><td>${esc(i.record_id)}</td><td>${esc(i.severity)}</td><td>${esc(i.category)}</td><td>${esc(i.message)}</td></tr>`).join("");
+  $("#qaIssues").innerHTML = iss
+    ? `<table><tr><th>记录</th><th>级别</th><th>类别</th><th>说明</th></tr>${iss}</table>`
+    : '<div class="workflow-msg success">确定性校验未发现问题。</div>';
+}
+function renderQaCompare() {
+  const d = _qa;
+  const counts = {};
+  (d.records||[]).forEach(r2 => (r2.source?.block_ids||[]).forEach(b => { counts[b] = (counts[b]||0) + 1; }));
+  const opts = (d.chunks||[]).map(c => `<option value="${esc(c.chunk_id)}">${esc(c.chunk_id.slice(0,34))} (${c.chars} 字, ${counts[c.chunk_id]||0} 条)</option>`).join("");
+  $("#qaCompare").innerHTML = `<div class="box"><label>选择分块：<select id="qaChunk" onchange="qaChunk()" style="max-width:420px">${opts}</select></label>
+    <span class="hint">共 ${(d.records||[]).length} 条抽取记录</span></div>
+    <div class="cols"><div class="box"><h4>原文（Markdown）</h4><pre id="qaSrc" style="background:#fff;color:#1f2937;border:1px solid var(--line)"></pre></div>
+    <div class="box"><h4>抽取结果（JSON）</h4><pre id="qaRec" style="background:#fff;color:#1f2937;border:1px solid var(--line)"></pre></div></div>`;
+  qaChunk();
+}
+function qaChunk() {
+  const d = _qa; const id = $("#qaChunk")?.value;
+  const chunk = (d.chunks||[]).find(c => c.chunk_id === id);
+  $("#qaSrc").textContent = chunk ? chunk.content : "（无原文）";
+  const recs = (d.records||[]).filter(r2 => (r2.source?.block_ids||[]).includes(id));
+  $("#qaRec").textContent = recs.length
+    ? recs.map(r2 => JSON.stringify(r2, null, 2)).join("\n\n")
+    : "该分块没有对应抽取记录。";
+}
+function renderQaCorr() {
+  const d = _qa, st = d.stats || {};
+  const cor = d.corrections || [];
+  const rows = cor.map(c => `<tr><td>${esc(c.record_id)}</td><td>${esc(c.field)}</td>
+    <td>${esc(JSON.stringify(c.original)).slice(0,60)}</td><td>${esc(JSON.stringify(c.suggested)).slice(0,60)}</td>
+    <td>${esc(c.verdict)}</td><td>${c.applied ? '<span class="badge done">已应用</span>' : '<span class="badge run">待应用</span>'}</td></tr>`).join("");
+  const pending = cor.filter(c => !c.applied).length;
+  $("#qaCorr").innerHTML = `<div class="workflow-msg ${pending ? "warn" : "success"}">纠错覆盖：已应用 ${st.applied_count||0} / 共 ${cor.length} 条建议${pending ? `，待应用 ${pending} 条` : ""}。应用后覆盖写回核验记录，需重新导出 Excel 生效。</div>
+    ${rows ? `<table><tr><th>记录</th><th>字段</th><th>原值</th><th>B 建议</th><th>判定</th><th>状态</th></tr>${rows}</table>` : '<div class="workflow-msg success">所有记录均通过 Model B 校验，无需纠正。</div>'}
+    ${pending ? `<div class="workflow-actions"><button class="btn btn-primary" onclick="applyCorrections()">应用纠错并覆盖核验记录 (${pending})</button></div>` : ""}`;
+}
+async function applyCorrections() {
+  if (!confirm("应用全部待应用纠错建议？将覆盖写回核验记录（原值保留在 correction_log）。")) return;
+  const r = await fetch(`/api/jobs/${current.job_id}/step/apply-corrections`, { method:"POST" });
+  const d = await r.json().catch(()=>({}));
+  if (!r.ok) { alert(d.detail || "应用失败"); return; }
+  alert(`已应用 ${d.applied} 条${d.failed ? `，${d.failed} 条未过校验转人工` : ""}。${d.note||""}`);
+  await refresh(); showVerify();
+}
+
+// ── GEPA 飞轮面板（只读概览 + 人工晋升）───────────────────────────────
+async function loadGepa(manual) {
+  const box = $("#gepaBody"); if (!box) return;
+  if (manual) box.innerHTML = '<div class="empty">加载中…</div>';
+  let d;
+  try { d = await (await fetch("/api/gepa/overview")).json(); }
+  catch (e) { box.innerHTML = '<div class="workflow-msg error">加载 GEPA 概览失败</div>'; return; }
+  renderGepa(d);
+}
+function _num(v, n) { return v == null ? "-" : Number(v).toFixed(n); }
+function renderGepa(d) {
+  const box = $("#gepaBody");
+  if (!d.enabled || !(d.runs && d.runs.length)) {
+    box.innerHTML = '<div class="empty">暂无进化产物。用 CLI 先跑一轮：'
+      + '<pre style="display:inline-block;margin-left:8px;max-height:none">tcm-engine gepa evolve &lt;book_id&gt; -t general_rule.md</pre></div>';
+    return;
+  }
+  const s = d.summary || {};
+  const stats = [
+    [s.runs_total || 0, "进化运行", "var(--pri)"],
+    [s.improved_runs || 0, "有提升", "var(--ok)"],
+    [s.promote_total || 0, "已晋升", "var(--warn)"],
+    [_num(s.latest_best, 3), "最新 best", "var(--pri)"],
+  ].map(c => `<div class="st"><div class="v" style="color:${c[2]}">${c[0]}</div><div class="l">${c[1]}</div></div>`).join("");
+  const rv = localStorage.getItem("gepa_reviewer") || "web-user";
+  const rows = d.runs.map(r => {
+    const books = (r.book_ids || []).join(", ") || r.book_id || "-";
+    const fit = `${_num(r.baseline_fitness, 3)} → ${_num(r.best_fitness, 3)}`;
+    const badge = r.promoted ? '<span class="badge done">已晋升</span>'
+      : (r.improved ? '<span class="badge">可晋升</span>' : '<span class="badge run">未提升</span>');
+    const dis = r.promoted ? "disabled" : "";
+    const mode = r.mode === "flywheel" ? ' <span class="badge">跨书</span>' : "";
+    return `<tr><td>${esc(r.template)}${mode}</td><td title="${esc(books)}">${esc(books.slice(0, 40))}</td>
+      <td>${esc(r.run_id)}</td><td>${fit} ${badge}</td>
+      <td>${r.total_generations || 0}代 / ${r.eval_calls || 0}评 / ${r.total_tokens || 0}tk</td>
+      <td><button class="btn" ${dis} onclick="previewPromote('${esc(r.run_dir)}','${esc(r.template)}')">预览</button>
+        <button class="btn btn-primary" ${dis} onclick="doPromote('${esc(r.run_dir)}','${esc(r.template)}')">晋升</button></td></tr>`;
+  }).join("");
+  box.innerHTML = `<div class="stats">${stats}</div>
+    <div class="box"><h4>质量趋势 · best fitness（旧→新）</h4>${gepaSparkline(d.runs)}</div>
+    <div class="box"><h4>进化产物</h4>
+      <div class="workflow-actions" style="margin:0 0 10px"><label class="hint">审核人：<input id="gepaReviewer" class="inp" placeholder="web-user" value="${esc(rv)}"></label></div>
+      <table><tr><th>模板</th><th>书</th><th>run_id</th><th>适应度 baseline→best</th><th>规模</th><th>操作</th></tr>${rows}</table>
+      <div class="hint" style="margin-top:8px">晋升会改写 prompts/a/* 受管块并 bump 版本（空块=回滚）；随后对相关书 <code>tcm-engine book rerun &lt;book_id&gt; --from extract</code> 才作用于线上抽取。</div>
+    </div>`;
+}
+function gepaSparkline(runs) {
+  const pts = runs.slice().reverse();
+  const all = pts.flatMap(r => [r.best_fitness, r.baseline_fitness]).filter(v => v != null);
+  if (all.length < 1) return '<div class="hint">数据不足</div>';
+  const W = 560, H = 96, P = 12;
+  const min = Math.min(...all), max = Math.max(...all), rng = (max - min) || 1;
+  const x = i => P + (W - 2 * P) * (pts.length < 2 ? 0.5 : i / (pts.length - 1));
+  const y = v => H - P - (H - 2 * P) * ((v - min) / rng);
+  const poly = key => pts.map((r, i) => r[key] == null ? null : `${x(i).toFixed(1)},${y(r[key]).toFixed(1)}`).filter(Boolean).join(" ");
+  const base = poly("baseline_fitness"), best = poly("best_fitness");
+  const dots = pts.map((r, i) => r.best_fitness == null ? "" : `<circle cx="${x(i).toFixed(1)}" cy="${y(r.best_fitness).toFixed(1)}" r="2.6" fill="var(--pri)"/>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px">
+    ${base ? `<polyline fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" points="${base}"/>` : ""}
+    <polyline fill="none" stroke="var(--pri)" stroke-width="2" points="${best}"/>${dots}</svg>
+    <div class="hint">实线=best fitness，虚线=baseline（横轴按时间，纵轴自适应 ${min.toFixed(3)}~${max.toFixed(3)}）</div>`;
+}
+function gepaReviewer() {
+  const el = $("#gepaReviewer"); const v = (el && el.value.trim()) || "web-user";
+  localStorage.setItem("gepa_reviewer", v); return v;
+}
+async function gepaPost(body) {
+  const r = await fetch("/api/gepa/promote", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { alert(d.detail || "操作失败"); return null; }
+  return d;
+}
+async function previewPromote(runDir, template) {
+  const d = await gepaPost({ run_dir: runDir, template, reviewer: gepaReviewer(), dry_run: true });
+  if (!d) return;
+  const blk = d.promoted_block ? ("胜出约束块：\n" + String(d.promoted_block).slice(0, 500)) : "（空约束块：晋升将移除受管块=回滚基线）";
+  alert(`【预览 · 未落盘】\n模板：${d.template}\n版本：${d.old_version} → ${d.new_version}${d.version_bumped ? "（将 bump）" : "（无变化）"}\n路径：${d.prompts_path}\n\n${blk}`);
+}
+async function doPromote(runDir, template) {
+  if (!confirm(`确认晋升该进化产物到 prompts/a/${template}？\n这会 bump 模板版本，需随后对相关书 rerun --from extract 才作用于线上抽取。`)) return;
+  const d = await gepaPost({ run_dir: runDir, template, reviewer: gepaReviewer(), dry_run: false });
+  if (!d) return;
+  if (!d.changed) { alert("模板无变化，未晋升。"); return; }
+  alert(d.version_bumped ? `已晋升：${d.template} version ${d.old_version}→${d.new_version}。\n下一步：对相关书 rerun --from extract。` : "已写入，但版本未变（内容相同）。");
+  loadGepa(true);
+}
+
+// ── 轮询 / 计时 ────────────────────────────────────────────────────────────
+function managePolling() {
+  const active = current && RUNNING.has(current.workflow_stage);
+  if (active) {
+    if (!_timer) _timer = setInterval(() => {
+      const el = $("#elapsed"); if (!el || !current) return;
+      el.textContent = Math.max(0, Math.round(Date.now()/1000 - (current.step_started_at||Date.now()/1000)));
+    }, 1000);
+    if (!_fast) _fast = setInterval(refresh, 1200);
+  } else {
+    clearInterval(_timer); _timer = null;
+    clearInterval(_fast); _fast = null;
+  }
+  // 蓝图面板按需加载
+  if (current && current.workflow_stage === "prompt_ready" && !$("#planBox")?.dataset?.loaded) loadPlan();
+}
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+refresh(); loadGepa(); setInterval(() => { if (!_fast) refresh(); }, 4000);
+</script>
+</body>
+</html>
