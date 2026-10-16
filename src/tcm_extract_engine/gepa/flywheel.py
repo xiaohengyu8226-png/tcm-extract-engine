@@ -85,6 +85,7 @@ def make_flywheel_evaluate_fn(
     verify_client: UnifiedLLMClient,
     work_dir_root: Path,
     verify_sample: int | None = 20,
+    vision_client: UnifiedLLMClient | None = None,
 ) -> Any:
     """构造跨书 evaluate_fn：对每本书评估候选约束块，聚合成一个 FitnessResult。
 
@@ -95,9 +96,7 @@ def make_flywheel_evaluate_fn(
     """
     from tcm_extract_engine.gepa.engine import FitnessResult
 
-    async def evaluate(
-        individual: PromptIndividual, chunks: Any = None
-    ) -> FitnessResult:
+    async def evaluate(individual: PromptIndividual, chunks: Any = None) -> FitnessResult:
         _ = chunks
         all_issues: list[dict[str, Any]] = []
         total_candidates = 0
@@ -115,9 +114,15 @@ def make_flywheel_evaluate_fn(
                 verify_client=verify_client,
                 work_dir=work_dir,
                 verify_sample=verify_sample,
+                vision_client=vision_client,
             )
-            all_issues.extend(outcome.issues)
-            total_candidates += outcome.records_in_scope
+            import re
+            for issue in outcome.issues:
+                shifted = dict(issue)
+                shifted["json_pointer"] = re.sub(r"^/records/(\d+)",
+                    lambda match: f"/records/{total_candidates + int(match[1])}", issue.get("json_pointer", ""))
+                all_issues.append(shifted)
+            total_candidates += outcome.evaluated_records
             per_instance[sl.book_id] = outcome.fitness.fitness
             if outcome.feedback:
                 feedback_parts.append(f"【{sl.book_id}】\n{outcome.feedback}")
@@ -150,6 +155,7 @@ async def evolve_across_books(
     verify_client: UnifiedLLMClient | None = None,
     reflect_client: UnifiedLLMClient | None = None,
     on_generation: Any = None,
+    vision_client: UnifiedLLMClient | None = None,
 ) -> EvolveResult:
     """在多本书切片上跑 GEPA 进化（Pareto 跨书选择），落盘 + 记台账。
 
@@ -189,6 +195,14 @@ async def evolve_across_books(
             reflect_client = UnifiedLLMClient(settings.prompt_llm)
             owned.append(reflect_client)
 
+    if vision_client is None:
+        from tcm_extract_engine.common.config import get_settings
+
+        vision_client = UnifiedLLMClient(get_settings().vision_llm)
+        owned.append(vision_client)
+    from tcm_extract_engine.core.usage import snapshot_usage, usage_delta
+    role_clients = {"extract": extract_client, "verify": verify_client, "vision": vision_client, "reflect": reflect_client}
+    usage_before = snapshot_usage(role_clients)
     evaluate_fn = make_flywheel_evaluate_fn(
         slices=slices,
         template=template,
@@ -196,10 +210,9 @@ async def evolve_across_books(
         verify_client=verify_client,
         work_dir_root=cands_dir,
         verify_sample=verify_sample,
+        vision_client=vision_client,
     )
-    proposer = make_reflective_proposer(
-        llm_client=reflect_client, target_template=template
-    )
+    proposer = make_reflective_proposer(llm_client=reflect_client, target_template=template)
     merger = (
         make_system_aware_merger(llm_client=reflect_client, target_template=template)
         if use_merge
@@ -210,7 +223,7 @@ async def evolve_across_books(
         max_generations=generations,
         eval_sample_size=1,
         convergence_threshold=1.5,
-        selection_strategy="pareto",     # 跨书 Pareto：任一本书最优即留前沿
+        selection_strategy="pareto",  # 跨书 Pareto：任一本书最优即留前沿
         crossover_rate=effective_crossover,
         budget_metric_calls=budget,
     )
@@ -233,8 +246,10 @@ async def evolve_across_books(
 
     try:
         if with_baseline:
-            base_fr = await evaluate_fn(seed)   # 复用 seed 缓存目录，gen0 命中
+            base_fr = await evaluate_fn(seed)  # 复用 seed 缓存目录，gen0 命中
             baseline_fitness = base_fr.fitness
+            engine._eval_calls = 1
+            engine._evaluation_cache[seed.fingerprint()] = base_fr
         report = await engine.optimize(
             initial_individual=seed,
             sample_chunks=[None],
@@ -251,17 +266,7 @@ async def evolve_across_books(
     best_path = run_dir / "best_constraint.md"
     best_path.write_text(best_block + "\n", encoding="utf-8")
 
-    tokens = {
-        "extract_input": extract_client.usage.input_tokens,
-        "extract_output": extract_client.usage.output_tokens,
-        "extract_calls": extract_client.usage.calls,
-        "verify_input": verify_client.usage.input_tokens,
-        "verify_output": verify_client.usage.output_tokens,
-        "verify_calls": verify_client.usage.calls,
-        "reflect_input": reflect_client.usage.input_tokens,
-        "reflect_output": reflect_client.usage.output_tokens,
-        "reflect_calls": reflect_client.usage.calls,
-    }
+    tokens = usage_delta(role_clients, usage_before)
     total_tokens = sum(
         v for k, v in tokens.items() if k.endswith("_input") or k.endswith("_output")
     )
@@ -294,6 +299,8 @@ async def evolve_across_books(
             "baseline_fitness": baseline_fitness,
             "best_fitness": report.final_fitness,
             "improved": improved,
+            "promotion_eligible": False,
+            "gold_status": "pending_human_confirmation",
             "fitness_history": report.fitness_history,
             "total_generations": report.total_generations,
             "eval_calls": engine._eval_calls,
@@ -331,7 +338,12 @@ async def evolve_across_books(
     )
     logger.info(
         "[Flywheel] 跨书进化完成 template=%s books=%d run=%s baseline=%s best=%.4f improved=%s",
-        template, len(slices), run_id, baseline_fitness, report.final_fitness, improved,
+        template,
+        len(slices),
+        run_id,
+        baseline_fitness,
+        report.final_fitness,
+        improved,
     )
     return EvolveResult(
         book_id=",".join(sl.book_id for sl in slices),
@@ -385,10 +397,24 @@ async def evolve_all_templates(
     三个 LLM 客户端在批处理内只创建/复用一次，全部模板共享（用量累计）。
     on_template(template, result_or_none, skip_reason) 在每个模板结束时回调，供 CLI 实时渲染。
     """
-    from tcm_extract_engine.cab.planner import EXTRACTOR_TEMPLATES
-    from tcm_extract_engine.common.config import get_settings
+    import json
 
-    targets = templates or list(EXTRACTOR_TEMPLATES.values())
+    from tcm_extract_engine.common.config import get_settings
+    from tcm_extract_engine.domains import get_domain_pack
+
+    if templates is None:
+        target_set: set[str] = set()
+        for book_id in book_ids:
+            manifest_path = Path(books_root) / book_id / "manifest.json"
+            domain_id = (
+                json.loads(manifest_path.read_text()).get("domain_id", "tcm")
+                if manifest_path.is_file()
+                else "tcm"
+            )
+            target_set.update(get_domain_pack(domain_id).extractor_templates.values())
+        targets = sorted(target_set)
+    else:
+        targets = templates
     owned: list[UnifiedLLMClient] = []
     if extract_client is None or verify_client is None or reflect_client is None:
         settings = get_settings()

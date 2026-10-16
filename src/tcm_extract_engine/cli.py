@@ -93,8 +93,7 @@ async def _run_book_command(
     finally:
         await pipeline.close()
     console.print(
-        f"[green]✓[/] {success_verb}完成: {manifest.book_id} "
-        f"状态={manifest.status.value}"
+        f"[green]✓[/] {success_verb}完成: {manifest.book_id} 状态={manifest.status.value}"
     )
     for stage, record in manifest.stages.items():
         console.print(
@@ -108,9 +107,13 @@ async def _run_book_command(
 def book_run(
     source: Annotated[Path, typer.Argument(help="源文件或目录（PDF/Markdown）")],
     books_root: BooksRoot = None,
+    domain: Annotated[str, typer.Option("--domain", help="领域包：general/tcm")] = "general",
     confirm_plan: Annotated[
-        bool, typer.Option("--confirm-plan/--no-confirm-plan",
-                           help="自动确认抽取计划（默认；--no-confirm-plan 停在人工确认门")
+        bool,
+        typer.Option(
+            "--confirm-plan/--no-confirm-plan",
+            help="自动确认抽取计划（默认；--no-confirm-plan 停在人工确认门",
+        ),
     ] = True,
 ) -> None:
     """批量建书并跑到核验完成（止于 WAITING_REVIEW）。"""
@@ -119,9 +122,13 @@ def book_run(
         raise typer.Exit(1)
 
     files = (
-        sorted(p for p in source.iterdir()
-               if p.is_file() and p.suffix.lower() in {".pdf", ".md", ".markdown"})
-        if source.is_dir() else [source]
+        sorted(
+            p
+            for p in source.iterdir()
+            if p.is_file() and p.suffix.lower() in {".pdf", ".md", ".markdown"}
+        )
+        if source.is_dir()
+        else [source]
     )
     if not files:
         console.print(f"[red]错误:[/] 未找到可处理文件: {source}")
@@ -132,11 +139,13 @@ def book_run(
     for path in files:
         console.print(f"[bold]处理:[/] {path.name}")
         try:
-            asyncio.run(_run_book_command(
-                books_root,
-                lambda p, path=path: p.run(path, confirm_plan=confirm_plan),
-                success_verb="运行",
-            ))
+            asyncio.run(
+                _run_book_command(
+                    books_root,
+                    lambda p, path=path: p.run(path, confirm_plan=confirm_plan, domain_id=domain),
+                    success_verb="运行",
+                )
+            )
         except typer.Exit:
             failed.append(path.name)
     if failed:
@@ -148,14 +157,17 @@ def book_run(
 def book_run_one(
     source: Annotated[Path, typer.Argument(help="单个源文件（PDF/Markdown）")],
     books_root: BooksRoot = None,
+    domain: Annotated[str, typer.Option("--domain", help="领域包：general/tcm")] = "general",
     confirm_plan: Annotated[bool, typer.Option("--confirm-plan/--no-confirm-plan")] = True,
 ) -> None:
     """单本书跑到核验完成。"""
-    asyncio.run(_run_book_command(
-        books_root,
-        lambda p: p.run(source, confirm_plan=confirm_plan),
-        success_verb="运行",
-    ))
+    asyncio.run(
+        _run_book_command(
+            books_root,
+            lambda p: p.run(source, confirm_plan=confirm_plan, domain_id=domain),
+            success_verb="运行",
+        )
+    )
 
 
 @book_app.command("resume")
@@ -164,24 +176,34 @@ def book_resume(
     books_root: BooksRoot = None,
 ) -> None:
     """继续未完成的书（跳过已完成阶段）。"""
-    asyncio.run(_run_book_command(
-        books_root, lambda p: p.resume(book_id), success_verb="续跑",
-    ))
+    asyncio.run(
+        _run_book_command(
+            books_root,
+            lambda p: p.resume(book_id),
+            success_verb="续跑",
+        )
+    )
 
 
 @book_app.command("rerun")
 def book_rerun(
     book_id: Annotated[str, typer.Argument(help="书籍 ID")],
     from_stage: Annotated[
-        str, typer.Option("--from", help="从该阶段强制重跑（parse/profile/plan/extract/validate/verify）")
+        str,
+        typer.Option(
+            "--from", help="从该阶段强制重跑（parse/profile/plan/extract/validate/verify）"
+        ),
     ],
     books_root: BooksRoot = None,
 ) -> None:
     """从指定阶段强制重跑（下游阶段作废）。"""
-    asyncio.run(_run_book_command(
-        books_root, lambda p: p.rerun(book_id, from_stage=from_stage),
-        success_verb="重跑",
-    ))
+    asyncio.run(
+        _run_book_command(
+            books_root,
+            lambda p: p.rerun(book_id, from_stage=from_stage),
+            success_verb="重跑",
+        )
+    )
 
 
 @book_app.command("retry")
@@ -190,9 +212,13 @@ def book_retry(
     books_root: BooksRoot = None,
 ) -> None:
     """重置 FAILED 后继续。"""
-    asyncio.run(_run_book_command(
-        books_root, lambda p: p.retry(book_id), success_verb="重试",
-    ))
+    asyncio.run(
+        _run_book_command(
+            books_root,
+            lambda p: p.retry(book_id),
+            success_verb="重试",
+        )
+    )
 
 
 @book_app.command("confirm")
@@ -231,13 +257,13 @@ def book_status_cmd(
     table.add_row("hash", manifest.file_hash[:23] + "…")
     if manifest.error:
         table.add_row("[red]错误[/]", manifest.error[:120])
-    for stage in ("parse", "profile", "plan", "extract", "validate",
-                  "verify", "review", "publish"):
+    for stage in ("parse", "profile", "plan", "extract", "validate", "verify", "review", "publish"):
         record = manifest.stages.get(stage)
         if record:
             table.add_row(
-                stage, f"{record.status} (records={record.records})"
-                + (f" err={record.error[:60]}" if record.error else "")
+                stage,
+                f"{record.status} (records={record.records})"
+                + (f" err={record.error[:60]}" if record.error else ""),
             )
     console.print(table)
 
@@ -259,7 +285,9 @@ def book_list(books_root: BooksRoot = None) -> None:
     for m in manifests:
         extract = m.stages.get("extract")
         table.add_row(
-            m.book_id, m.file_name[:30], m.status.value,
+            m.book_id,
+            m.file_name[:30],
+            m.status.value,
             str(extract.records) if extract and extract.records else "-",
         )
     console.print(table)
@@ -268,9 +296,7 @@ def book_list(books_root: BooksRoot = None) -> None:
 # ── GEPA 进化子命令 ──────────────────────────────────────────────────────────
 
 
-def _gepa_roots(
-    books_root: Path | None, out_root: Path | None
-) -> tuple[Path, Path]:
+def _gepa_roots(books_root: Path | None, out_root: Path | None) -> tuple[Path, Path]:
     from tcm_extract_engine.common.paths import project_paths
 
     br = books_root or project_paths.books
@@ -289,7 +315,8 @@ def gepa_evolve(
         Path | None, typer.Option("--out-root", help="进化产物根目录（默认 workspace/gepa）")
     ] = None,
     section_id: Annotated[
-        list[str] | None, typer.Option("--section", help="只进化指定章节（可多次；默认全部同模板章节）")
+        list[str] | None,
+        typer.Option("--section", help="只进化指定章节（可多次；默认全部同模板章节）"),
     ] = None,
     population: Annotated[int, typer.Option("--population", help="种群大小")] = 2,
     generations: Annotated[int, typer.Option("--generations", help="最大代数")] = 2,
@@ -300,9 +327,7 @@ def gepa_evolve(
     selection_strategy: Annotated[
         str, typer.Option("--selection", help="父代选择：pareto|scalar")
     ] = "pareto",
-    no_baseline: Annotated[
-        bool, typer.Option("--no-baseline", help="跳过基线评估")
-    ] = False,
+    no_baseline: Annotated[bool, typer.Option("--no-baseline", help="跳过基线评估")] = False,
 ) -> None:
     """对「一本书 × 一个 A 模板」跑小预算 GEPA 进化并落盘产物（不碰 prompts/）。"""
     from tcm_extract_engine.gepa.runner import evolve_template
@@ -311,8 +336,7 @@ def gepa_evolve(
 
     def on_gen(rep: Any) -> None:
         console.print(
-            f"  [dim]gen {rep.generation}[/] best={rep.best_fitness:.4f} "
-            f"avg={rep.avg_fitness:.4f}"
+            f"  [dim]gen {rep.generation}[/] best={rep.best_fitness:.4f} avg={rep.avg_fitness:.4f}"
         )
 
     async def _run() -> Any:
@@ -353,9 +377,7 @@ def gepa_evolve(
     console.print(table)
     console.print("\n[bold]胜出约束块：[/]")
     console.print(result.best_constraint or "[dim]（空，等同基线）[/]")
-    console.print(
-        f"\n[yellow]晋升：[/] tcm-engine gepa promote {result.run_dir} --reviewer <you>"
-    )
+    console.print(f"\n[yellow]晋升：[/] tcm-engine gepa promote {result.run_dir} --reviewer <you>")
 
 
 @gepa_app.command("promote")
@@ -364,18 +386,14 @@ def gepa_promote(
     template: Annotated[
         str | None, typer.Option("--template", "-t", help="覆盖 run 内的模板名")
     ] = None,
-    reviewer: Annotated[
-        str, typer.Option("--reviewer", "-r", help="审核人标识")
-    ] = "cli-user",
+    reviewer: Annotated[str, typer.Option("--reviewer", "-r", help="审核人标识")] = "cli-user",
     prompts_root: Annotated[
         Path | None, typer.Option("--prompts-root", help="提示词根目录（默认 prompts/）")
     ] = None,
     out_root: Annotated[
         Path | None, typer.Option("--out-root", help="进化产物根目录（用于写趋势台账）")
     ] = None,
-    dry_run: Annotated[
-        bool, typer.Option("--dry-run", help="只预览版本变化，不落盘")
-    ] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="只预览版本变化，不落盘")] = False,
 ) -> None:
     """人工门：把胜出约束块写入 prompts/a/<template> 的受管标记块（触发 version bump）。"""
     from tcm_extract_engine.gepa.runner import (
@@ -395,9 +413,7 @@ def gepa_promote(
 
     target = template or run_template
     if not block:
-        console.print(
-            "[yellow]胜出约束块为空（等同基线），晋升将移除受管块（回滚）。[/]"
-        )
+        console.print("[yellow]胜出约束块为空（等同基线），晋升将移除受管块（回滚）。[/]")
     _, oroot = _gepa_roots(None, out_root)
     try:
         res = promote_constraint(
@@ -424,20 +440,14 @@ def gepa_promote(
     )
     console.print(f"  路径: {res.prompts_path}")
     if not res.dry_run:
-        console.print(
-            "  [yellow]下一步：对相关书重刷 extract（version 已变，幂等判定会重抽）：[/]"
-        )
+        console.print("  [yellow]下一步：对相关书重刷 extract（version 已变，幂等判定会重抽）：[/]")
         console.print("    tcm-engine book rerun <book_id> --from extract")
 
 
 @gepa_app.command("runs")
 def gepa_runs(
-    out_root: Annotated[
-        Path | None, typer.Option("--out-root", help="进化产物根目录")
-    ] = None,
-    book_id: Annotated[
-        str | None, typer.Option("--book", help="只看某本书")
-    ] = None,
+    out_root: Annotated[Path | None, typer.Option("--out-root", help="进化产物根目录")] = None,
+    book_id: Annotated[str | None, typer.Option("--book", help="只看某本书")] = None,
 ) -> None:
     """列出已落盘的 evolve 运行产物。"""
     from tcm_extract_engine.core.artifacts import load_artifact
@@ -456,13 +466,15 @@ def gepa_runs(
         if book_id and bid != book_id:
             continue
         base = data.get("baseline_fitness")
-        rows.append((
-            bid,
-            str(data.get("template", "")),
-            str(data.get("run_id", "")),
-            f"{base:.3f}" if isinstance(base, float) else "-",
-            f"{data.get('best_fitness', 0):.3f}",
-        ))
+        rows.append(
+            (
+                bid,
+                str(data.get("template", "")),
+                str(data.get("run_id", "")),
+                f"{base:.3f}" if isinstance(base, float) else "-",
+                f"{data.get('best_fitness', 0):.3f}",
+            )
+        )
     if not rows:
         console.print("[dim]暂无进化产物[/]")
         return
@@ -476,9 +488,7 @@ def gepa_runs(
 
 @gepa_app.command("evolve-multi")
 def gepa_evolve_multi(
-    book_ids: Annotated[
-        list[str], typer.Argument(help="一个或多个书籍 ID（跨书 Pareto 进化）")
-    ],
+    book_ids: Annotated[list[str], typer.Argument(help="一个或多个书籍 ID（跨书 Pareto 进化）")],
     template: Annotated[
         str, typer.Option("--template", "-t", help="被进化的 A 模板文件名")
     ] = "general_rule.md",
@@ -492,9 +502,7 @@ def gepa_evolve_multi(
     verify_sample: Annotated[
         int, typer.Option("--verify-sample", help="B 核验采样上限；-1=全量")
     ] = 20,
-    no_baseline: Annotated[
-        bool, typer.Option("--no-baseline", help="跳过基线评估")
-    ] = False,
+    no_baseline: Annotated[bool, typer.Option("--no-baseline", help="跳过基线评估")] = False,
     merge: Annotated[
         bool, typer.Option("--merge", help="启用 system-aware 合并（官方 GEPA 机制④）")
     ] = False,
@@ -506,8 +514,7 @@ def gepa_evolve_multi(
 
     def on_gen(rep: Any) -> None:
         console.print(
-            f"  [dim]gen {rep.generation}[/] best={rep.best_fitness:.4f} "
-            f"avg={rep.avg_fitness:.4f}"
+            f"  [dim]gen {rep.generation}[/] best={rep.best_fitness:.4f} avg={rep.avg_fitness:.4f}"
         )
 
     async def _run() -> Any:
@@ -549,16 +556,12 @@ def gepa_evolve_multi(
     console.print(table)
     console.print("\n[bold]胜出约束块：[/]")
     console.print(result.best_constraint or "[dim]（空，等同基线）[/]")
-    console.print(
-        f"\n[yellow]晋升：[/] tcm-engine gepa promote {result.run_dir} --reviewer <you>"
-    )
+    console.print(f"\n[yellow]晋升：[/] tcm-engine gepa promote {result.run_dir} --reviewer <you>")
 
 
 @gepa_app.command("evolve-all")
 def gepa_evolve_all(
-    book_ids: Annotated[
-        list[str], typer.Argument(help="一个或多个书籍 ID（跨书 Pareto 进化）")
-    ],
+    book_ids: Annotated[list[str], typer.Argument(help="一个或多个书籍 ID（跨书 Pareto 进化）")],
     books_root: BooksRoot = None,
     out_root: Annotated[
         Path | None, typer.Option("--out-root", help="进化产物根目录（默认 workspace/gepa）")
@@ -568,15 +571,11 @@ def gepa_evolve_all(
     ] = None,
     population: Annotated[int, typer.Option("--population", help="种群大小")] = 2,
     generations: Annotated[int, typer.Option("--generations", help="最大代数")] = 2,
-    budget: Annotated[
-        int, typer.Option("--budget", help="每模板评估调用预算上限")
-    ] = 6,
+    budget: Annotated[int, typer.Option("--budget", help="每模板评估调用预算上限")] = 6,
     verify_sample: Annotated[
         int, typer.Option("--verify-sample", help="B 核验采样上限；-1=全量")
     ] = 20,
-    no_baseline: Annotated[
-        bool, typer.Option("--no-baseline", help="跳过基线评估")
-    ] = False,
+    no_baseline: Annotated[bool, typer.Option("--no-baseline", help="跳过基线评估")] = False,
     merge: Annotated[
         bool, typer.Option("--merge", help="启用 system-aware 合并（官方 GEPA 机制④）")
     ] = False,
@@ -610,10 +609,7 @@ def gepa_evolve_all(
             on_template=on_template,
         )
 
-    console.print(
-        f"[bold]GEPA 全模板进化[/] books={len(book_ids)}"
-        f"{' merge=on' if merge else ''}\n"
-    )
+    console.print(f"[bold]GEPA 全模板进化[/] books={len(book_ids)}{' merge=on' if merge else ''}\n")
     try:
         outcome = asyncio.run(_run())
     except Exception as exc:
@@ -624,14 +620,8 @@ def gepa_evolve_all(
     for col in ("模板", "baseline", "best", "↑", "建议", "run"):
         table.add_column(col, style="cyan")
     for res in outcome.results:
-        base = (
-            f"{res.baseline_fitness:.3f}"
-            if res.baseline_fitness is not None
-            else "-"
-        )
-        advise = (
-            f"promote {res.run_dir}" if res.improved else "维持基线"
-        )
+        base = f"{res.baseline_fitness:.3f}" if res.baseline_fitness is not None else "-"
+        advise = f"promote {res.run_dir}" if res.improved else "维持基线"
         table.add_row(
             res.template,
             base,
@@ -643,19 +633,13 @@ def gepa_evolve_all(
     for tpl, reason in outcome.skipped.items():
         table.add_row(tpl, "-", "-", "", f"[yellow]跳过[/] {reason[:40]}", "-")
     console.print(table)
-    console.print(
-        "\n[dim]晋升某模板：tcm-engine gepa promote <run_dir> --reviewer <you>[/]"
-    )
+    console.print("\n[dim]晋升某模板：tcm-engine gepa promote <run_dir> --reviewer <you>[/]")
 
 
 @gepa_app.command("trend")
 def gepa_trend(
-    out_root: Annotated[
-        Path | None, typer.Option("--out-root", help="进化产物根目录")
-    ] = None,
-    template: Annotated[
-        str | None, typer.Option("--template", "-t", help="只看某模板")
-    ] = None,
+    out_root: Annotated[Path | None, typer.Option("--out-root", help="进化产物根目录")] = None,
+    template: Annotated[str | None, typer.Option("--template", "-t", help="只看某模板")] = None,
     limit: Annotated[int, typer.Option("--limit", help="最多显示条数")] = 30,
 ) -> None:
     """质量趋势看板：按时间线展示 evolve/promote 的适应度与晋升轨迹。"""
@@ -682,7 +666,13 @@ def gepa_trend(
         else:
             tail = f"calls={r.eval_calls} tok={r.total_tokens}"
         table.add_row(
-            r.ts[:19], r.kind, r.template, str(len(r.book_ids)),
-            base, best, "✓" if r.improved else "", tail,
+            r.ts[:19],
+            r.kind,
+            r.template,
+            str(len(r.book_ids)),
+            base,
+            best,
+            "✓" if r.improved else "",
+            tail,
         )
     console.print(table)

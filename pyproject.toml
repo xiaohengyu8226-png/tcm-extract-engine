@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "openai>=1.30",
     "pydantic>=2.7",
+    "httpx>=0.27",
 ]
 
 [project.scripts]
@@ -39,6 +40,8 @@ ignore = ["E501", "ANN101", "ANN102", "ANN401"]
 known-first-party = ["tcm_extract_engine"]
 
 [tool.pyright]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.10"
 typeCheckingMode = "basic"
 include = ["src", "tests"]

@@ -20,7 +20,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 from tcm_extract_engine.gepa.gateway_types import AsyncModelGateway, SourceChunk
 
@@ -427,7 +427,7 @@ class GEPAEngine:
 
     def __init__(
         self,
-        gateway: AsyncModelGateway,
+        gateway: AsyncModelGateway | None,
         config: GEPAConfig | None = None,
         *,
         extract_model: str = "",
@@ -438,6 +438,8 @@ class GEPAEngine:
         evaluate_fn: EvaluateFn | None = None,
         merge_fn: MergeFn | None = None,
     ) -> None:
+        if gateway is None and evaluate_fn is None:
+            raise ValueError("GEPA 需要 gateway 或 evaluate_fn")
         self._gateway = gateway
         self._config = config or GEPAConfig()
         self._extract_model = extract_model
@@ -449,12 +451,13 @@ class GEPAEngine:
         self._instruction_proposer = instruction_proposer  # 反思式变异（官方 GEPA 机制 1）
         self._evaluate_fn = evaluate_fn                    # 真实评估（注入 pipeline 闭环）
         self._merge_fn = merge_fn                          # system-aware 合并（官方 GEPA 机制 4）
+        self._evaluation_cache: dict[str, FitnessResult] = {}
         self._eval_calls = 0                               # 评估调用计数（budget_metric_calls 停止）
 
     async def optimize(
         self,
         initial_individual: PromptIndividual,
-        sample_chunks: Sequence[SourceChunk],
+        sample_chunks: Sequence[SourceChunk | None],
         *,
         extraction_system_prompt: str = "",
         verification_system_prompt: str = "",
@@ -477,7 +480,9 @@ class GEPAEngine:
         cfg = self._config
 
         # 截断样本
-        eval_chunks = list(sample_chunks[:cfg.eval_sample_size])
+        eval_chunks = cast(list[SourceChunk], list(sample_chunks[:cfg.eval_sample_size]))
+        if self._evaluate_fn is None and any(chunk is None for chunk in eval_chunks):
+            raise ValueError("内置 GEPA 评估需要有效 SourceChunk")
         if not eval_chunks:
             raise ValueError("GEPA 需要至少 1 个评估样本 chunk")
 
@@ -485,11 +490,15 @@ class GEPAEngine:
         population = [initial_individual]
         # 补充随机变异版本填满种群
         for i in range(1, cfg.population_size):
-            mutated = mutate_prompt(initial_individual, FitnessResult(
-                fitness=0.5, pass_rate=0.5, penalty_rate=0.5,
-                missing_rate=0.5, hallucination_rate=0.5,
-                issue_stats=IssueStats(),
-            ), mutation_rate=1.0)
+            baseline = self._evaluation_cache.get(initial_individual.fingerprint())
+            if self._instruction_proposer is not None and baseline is not None:
+                mutated = await self._propose(initial_individual, baseline, 1.0)
+            else:
+                mutated = mutate_prompt(initial_individual, FitnessResult(
+                    fitness=0.5, pass_rate=0.5, penalty_rate=0.5,
+                    missing_rate=0.5, hallucination_rate=0.5,
+                    issue_stats=IssueStats(),
+                ), mutation_rate=1.0)
             population.append(mutated)
 
         fitness_history: list[float] = []
@@ -640,10 +649,14 @@ class GEPAEngine:
 
         每次评估计一次 metric call（供 budget_metric_calls 停止）。
         """
+        key = individual.fingerprint()
+        if self._evaluate_fn is not None and key in self._evaluation_cache:
+            return self._evaluation_cache[key]
         self._eval_calls += 1
         if self._evaluate_fn is not None:
-            result = self._evaluate_fn(individual, chunks)
-            return await _resolve(result)
+            result = await _resolve(self._evaluate_fn(individual, chunks))
+            self._evaluation_cache[key] = result
+            return result
         return await self._evaluate(
             individual,
             chunks,
@@ -734,6 +747,7 @@ class GEPAEngine:
             }, ensure_ascii=False)
 
             try:
+                assert self._gateway is not None
                 resp = await self._gateway.generate(
                     model=self._extract_model,
                     system_prompt=extraction_system_prompt,
@@ -772,6 +786,7 @@ class GEPAEngine:
             }, ensure_ascii=False)
 
             try:
+                assert self._gateway is not None
                 resp = await self._gateway.generate(
                     model=self._verify_model,
                     system_prompt=verification_system_prompt,

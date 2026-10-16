@@ -1,0 +1,101 @@
+{
+  "id": "tcm",
+  "label": "中医安全审方",
+  "goal": "中药饮片安全审方规则库建设",
+  "profile_domain": "TCM_PRESCRIPTION_SAFETY",
+  "prompts_root": null,
+  "dose_outlier_grams": 1000.0,
+  "review_verdicts": [
+    "UNSUPPORTED",
+    "MISSING",
+    "WRONG_DOSE",
+    "WRONG_RELATION",
+    "WRONG_NORMALIZATION",
+    "OCR_UNCERTAIN",
+    "FIGURE_REVIEW"
+  ],
+  "labels": {
+    "extractor": {
+      "GeneralRuleExtractor": "通用规则抽取",
+      "HerbTableExtractor": "中药表格抽取",
+      "InteractionExtractor": "配伍关系抽取",
+      "PregnancyRuleExtractor": "妊娠用药抽取",
+      "HerbFactsExtractor": "药物专论抽取",
+      "FigureExtractor": "图片多模态抽取"
+    },
+    "template": {
+      "general_rule.md": "通用规则",
+      "herb_table.md": "中药表格",
+      "interaction_group.md": "配伍关系",
+      "pregnancy_list.md": "妊娠用药",
+      "herb_facts.md": "药物专论",
+      "figure.md": "图片多模态"
+    },
+    "content_type": {
+      "NARRATIVE_RULE": "叙述性规则",
+      "STRUCTURED_TABLE": "结构化表格",
+      "ENTITY_LIST": "实体清单",
+      "ENTITY_GROUP_LIST": "分组实体清单",
+      "RELATION_PAIR": "两两关系",
+      "RELATION_GROUP": "关系组",
+      "HERB_MONOGRAPH": "药物专论",
+      "CASE_RECORD": "医案",
+      "FORMULA_RECORD": "方剂",
+      "FIGURE": "图片/图表",
+      "REFERENCE_ONLY": "仅参考",
+      "IRRELEVANT": "无关"
+    },
+    "record_type": {
+      "GENERAL_RULE": "一般规则",
+      "HERB_TABLE": "药物条目",
+      "TABLE_ROW": "表格直通",
+      "INTERACTION": "配伍禁忌",
+      "PREGNANCY": "妊娠禁忌",
+      "DOSAGE": "剂量规范",
+      "USAGE": "特殊用法",
+      "POPULATION": "特殊人群",
+      "HERB_FACTS": "药物事实",
+      "FIGURE": "图片多模态"
+    },
+    "action": {
+      "PROHIBIT": "禁用",
+      "AVOID": "忌用/不宜",
+      "CAUTION": "慎用",
+      "MONITOR": "需监测",
+      "INFO": "提示"
+    },
+    "verdict": {
+      "SUPPORTED": "已证实",
+      "PARTIAL": "部分证实",
+      "UNSUPPORTED": "未获原文支持",
+      "WRONG_NORMALIZATION": "名称规范化有误",
+      "WRONG_RELATION": "关系抽取有误",
+      "MISSING": "核验缺失",
+      "PASSTHROUGH": "直通免核验",
+      "FIGURE_REVIEW": "图片记录待人工复核"
+    },
+    "manual_skip": "人工标记不抽取"
+  },
+  "risk_rules": [
+    {
+      "min_counts": {"RELATION_GROUP": 1},
+      "text": "含十八反/十九畏关系组：关系组禁止被 chunk 切断，成员覆盖必须完整"
+    },
+    {
+      "min_counts": {"ENTITY_GROUP_LIST": 1},
+      "text": "含妊娠禁用/慎用清单：括号内炮制品成员需完整保留，措辞级别禁止互换"
+    },
+    {
+      "min_counts": {"STRUCTURED_TABLE": 1},
+      "text": "含结构化表格：按行抽取并做行数覆盖率校验；跨页表格需合并表头"
+    }
+  ],
+  "adaptation_fields": [
+    {"key": "terminology_aliases", "title": "术语别名", "is_list": true},
+    {"key": "table_format_notes", "title": "表格版式", "is_list": false},
+    {"key": "ocr_hotspots", "title": "OCR 高发错点", "is_list": true},
+    {"key": "processing_form_conventions", "title": "炮制品书写约定", "is_list": false},
+    {"key": "section_quirks", "title": "章节结构怪癖", "is_list": true},
+    {"key": "watch_points", "title": "重点盯防", "is_list": true}
+  ]
+}

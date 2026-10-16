@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>中医智能审方系统 · 逐步控制抽取</title>
+<title>知页 · 书籍知识抽取工作台</title>
 <style>
   :root { --bg:#f5f7fa; --card:#fff; --line:#e5e9f0; --pri:#2563eb; --muted:#8a94a6; --ok:#16a34a; --warn:#d97706; --err:#dc2626; }
   * { box-sizing:border-box; }
@@ -74,44 +74,78 @@
   select { font-size:12px; padding:3px 6px; border:1px solid var(--line); border-radius:6px; background:#fff; max-width:180px; }
   .inp { font-size:12px; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:#fff; width:160px; }
   code { background:#f1f5f9; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .pl-cat td { background:#f8fafc; font-weight:600; }
+  .pl-chip.on { background:#eef2ff; border-color:var(--pri); color:var(--pri); }
 </style>
+<link rel="stylesheet" href="/static/workbench.css" />
 </head>
 <body>
-<header>
-  <h1>中医智能审方系统</h1>
-  <span class="sub">PDF 结构化抽取 + 知识建设 · 引擎驱动 BookPipeline</span>
-  <div class="tabs">
-    <div class="tab" onclick="alert('批量抽取请用 CLI：tcm-engine book run <dir>')">批量抽取</div>
-    <div class="tab active">逐步控制抽取 (C/A/B)</div>
-    <div class="tab" onclick="alert('知识审核 / 发布留在 tcm-rag，本引擎不含')">知识审核</div>
+<aside class="sidebar">
+  <a class="brand" href="#documents" aria-label="知页工作台首页">
+    <span class="brand-mark"><svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M7 7h7a5 5 0 0 1 5 5v14a7 7 0 0 0-5-2H7V7Z" fill="currentColor" opacity=".3"/><path d="M25 5h-6a6 6 0 0 0-6 6v14a7 7 0 0 1 6-3h6V5Z" fill="currentColor"/><path d="M18 10h3m-3 4h3" stroke="white" stroke-width="1.5" stroke-linecap="round"/></svg></span>
+    <span class="brand-name">知页<span>书籍知识工作空间</span></span>
+  </a>
+  <div class="nav-section-label">工作空间</div>
+  <nav aria-label="主导航">
+    <button class="nav-item active" id="navDocuments" onclick="showPage('documents')"><span data-icon="documents"></span><span>文档工作台</span><span class="nav-count" id="navDocCount">—</span></button>
+    <button class="nav-item" id="navOptimization" onclick="showPage('optimization')"><span data-icon="sparkles"></span><span>提示词自优化</span></button>
+  </nav>
+  <div class="sidebar-bottom">
+    <div class="sidebar-note"><span data-icon="link"></span><strong>每一条知识，都有出处</strong><p>保留图文、页码与原文证据，让结果可查看、可核对。</p></div>
+    <button class="nav-item help-link" onclick="document.getElementById('helpDialog').showModal()"><span data-icon="help"></span><span>使用说明</span></button>
+    <div class="local-label"><span class="status-dot"></span><span>本地工作区</span></div>
   </div>
-</header>
-<main>
-  <div class="card">
-    <h2>上传文档</h2>
-    <div class="hint">交互式工作流专用 · 支持 PDF / Markdown（Markdown 免 GPU 直转）</div>
-    <div id="drop" class="drop">拖放或点击上传 PDF / Markdown 文件<br><button class="btn" style="margin-top:12px">选择文件</button></div>
-    <input id="file" type="file" accept=".pdf,.md,.markdown" style="display:none" multiple />
+</aside>
+<div class="app-shell">
+  <header class="app-header">
+    <div class="breadcrumb"><span data-icon="grid"></span><span>工作空间</span><span class="breadcrumb-separator">/</span><strong id="pageBreadcrumb">文档工作台</strong></div>
+    <div class="connection-status" id="connectionStatus"><span class="status-dot"></span><span>正在连接工作区</span></div>
+  </header>
+  <nav class="mobile-nav" aria-label="移动端导航"><button class="btn" onclick="showPage('documents')">文档工作台</button><button class="btn" onclick="showPage('optimization')">提示词自优化</button><button class="btn" onclick="document.getElementById('helpDialog').showModal()">使用说明</button></nav>
+  <main>
+    <section id="documentsPage">
+      <div class="page-heading">
+        <div><div class="eyebrow">从阅读材料，到可溯源的知识</div><h1>文档抽取工作台</h1><p>管理解析、抽取与核验，查看每一条记录的原始证据。</p></div>
+        <div class="heading-actions"><button class="btn btn-icon" onclick="refresh()" aria-label="刷新任务" title="刷新任务"><span data-icon="refresh"></span></button><button class="btn btn-primary" onclick="openUpload()"><span data-icon="plus"></span>导入文档</button></div>
+      </div>
+      <section class="overview-grid" id="overview" aria-label="工作区概览">
+        <div class="overview-card"><div><span class="metric-label">文档总数</span><strong id="metricDocuments">—</strong><small>当前工作区</small></div><span class="metric-icon" data-icon="documents"></span></div>
+        <div class="overview-card"><div><span class="metric-label">正在处理</span><strong id="metricRunning">—</strong><small>解析、抽取或核验中</small></div><span class="metric-icon amber" data-icon="activity"></span></div>
+        <div class="overview-card"><div><span class="metric-label">累计抽取记录</span><strong id="metricRecords">—</strong><small>包含待核验的初步记录</small></div><span class="metric-icon blue" data-icon="layers"></span></div>
+        <div class="overview-card"><div><span class="metric-label">需要处理</span><strong id="metricAttention">—</strong><small>失败任务或待确认方案</small></div><span class="metric-icon rose" data-icon="flag"></span></div>
+      </section>
+      <div class="workspace-grid">
+        <aside class="card jobs-card">
+          <div class="card-heading"><h2>我的文档 <span class="count-label" id="docCount">0</span></h2><span class="sort-label">最近更新</span></div>
+          <label class="search-field"><span data-icon="search"></span><input id="jobSearch" type="search" placeholder="搜索文档或编号" autocomplete="off" oninput="renderJobs()" aria-label="搜索文档"/><kbd>/</kbd></label>
+          <div class="job-filters" role="group" aria-label="筛选任务状态"><button class="filter-chip active" data-filter="all" onclick="setJobFilter('all')">全部</button><button class="filter-chip" data-filter="running" onclick="setJobFilter('running')">处理中</button><button class="filter-chip" data-filter="attention" onclick="setJobFilter('attention')">需处理</button><button class="filter-chip" data-filter="verified" onclick="setJobFilter('verified')">已核验</button></div>
+          <div id="jobs" class="job-list" aria-label="文档列表"><div class="empty">正在加载文档…</div></div>
+          <div class="list-footer"><span class="status-dot"></span>任务状态自动刷新</div>
+        </aside>
+        <article class="card workspace-card" id="wfCard">
+          <div class="workspace-heading"><div class="workspace-title"><span class="eyebrow">文档工作区</span><h2 id="wfTitle">选择一份文档</h2><div id="wfSubtitle" class="document-meta"></div></div><div id="wfHeaderActions" class="heading-actions"></div></div>
+          <div class="workspace-body"><div class="stepper" id="stepper" aria-label="处理进度"></div><div id="panel"><div class="empty-state"><div class="empty-illustration" data-icon="book"></div><h3>从一份文档开始</h3><p>选择左侧文档查看进度，或导入新的 PDF 与 Markdown。</p><button class="btn btn-primary" onclick="openUpload()">导入第一份文档</button></div></div></div>
+        </article>
+      </div>
+    </section>
+    <section id="optimizationPage" hidden>
+      <div class="page-heading"><div><div class="eyebrow">持续改进抽取效果</div><h1>提示词自优化</h1><p>查看 GEPA 实验、比较候选评分，在确认后应用新的提示词。</p></div><button class="btn" onclick="loadGepa(true)"><span data-icon="refresh"></span>刷新实验</button></div>
+      <div class="card optimization-card" id="gepaCard"><div class="card-heading"><h2>实验与质量趋势</h2><span class="badge neutral">人工确认后应用</span></div><div class="hint">评分来自模型辅助核验，不代表人工确认的知识准确率。</div><div id="gepaBody"><div class="empty">正在加载实验…</div></div></div>
+    </section>
+    <footer class="workspace-footer"><span>知页 · 书籍知识抽取</span><span>图文一体 / 来源可追溯</span></footer>
+  </main>
+</div>
+<dialog class="workbench-dialog" id="uploadDialog" aria-labelledby="uploadTitle">
+  <div class="dialog-heading"><div><span class="eyebrow">添加到工作空间</span><h2 id="uploadTitle">导入文档</h2></div><button class="btn btn-icon" id="closeUpload" onclick="document.getElementById('uploadDialog').close()" aria-label="关闭导入窗口">×</button></div>
+  <div class="dialog-body"><div id="drop" class="drop" role="button" tabindex="0" aria-label="选择或拖入文档"><span class="upload-icon" data-icon="upload"></span><strong>将文档拖到这里</strong><p>或点击选择文件 · 支持批量导入</p><span class="file-formats">PDF <span>·</span> Markdown <span>·</span> 单个文件最大 512 MB</span></div><input id="file" type="file" accept=".pdf,.md,.markdown" hidden multiple />
+    <label class="field-label" for="domain">抽取方式</label><select id="domain" class="full-select"><option value="general">通用知识 · 适合大多数书籍</option><option value="tcm">中药专业知识 · 剂量、配伍与用药规则</option></select>
+    <label class="toggle-option"><input id="autoRun" type="checkbox" checked /><span><strong>导入后自动处理</strong><small>自动完成解析、抽取与核验；关闭后可逐步确认方案。</small></span></label><div id="uploadStatus" aria-live="polite"></div>
   </div>
-
-  <div class="card">
-    <h2>交互式任务</h2>
-    <div class="hint">点击任务进入工作流 · 进度以 manifest 为权威状态，服务重启自动恢复</div>
-    <div id="jobs"><div class="empty">暂无任务，请先上传文档</div></div>
-  </div>
-
-  <div class="card" id="wfCard" style="display:none">
-    <h2 id="wfTitle">工作流</h2>
-    <div class="stepper" id="stepper"></div>
-    <div id="panel"></div>
-  </div>
-
-  <div class="card" id="gepaCard">
-    <h2>自优化飞轮 · GEPA</h2>
-    <div class="hint">离线提示词进化（C 反思→A/B 真实评分）· 与上方抽取流程解耦，仅经「人工晋升」写入 prompts/a/* 受管块并 bump 版本后才影响线上 · <a style="color:var(--pri);cursor:pointer" onclick="loadGepa(true)">刷新</a></div>
-    <div id="gepaBody"><div class="empty">加载中…</div></div>
-  </div>
-</main>
+</dialog>
+<dialog class="workbench-dialog" id="helpDialog" aria-labelledby="helpTitle"><div class="dialog-heading"><h2 id="helpTitle">如何使用工作台</h2><button class="btn btn-icon" onclick="document.getElementById('helpDialog').close()" aria-label="关闭使用说明">×</button></div><div class="dialog-body help-content"><h3>1. 导入并处理文档</h3><p>选择通用或中药专业抽取，可自动处理，也可逐步确认章节方案。</p><h3>2. 对照原文与图片</h3><p>打开一条记录，查看结构化内容、页码、原文及关联图片。待复核标记表示还需要人工确认。</p><h3>3. 核验并导出</h3><p>核验后查看问题和纠错建议，再下载知识、证据与质量报告。导出文件不会自动代表人工审核通过。</p><h3>任务失败怎么办？</h3><p>使用“重试当前步骤”，系统会复用兼容的成功缓存。只有需要变更方案或提示词时，才重新处理相应步骤。</p></div></dialog>
+<dialog class="workbench-dialog confirm-dialog" id="confirmDialog" aria-labelledby="confirmTitle"><div class="dialog-heading"><h2 id="confirmTitle">确认操作</h2></div><div class="dialog-body"><p id="confirmMessage"></p></div><div class="dialog-actions"><button class="btn" id="confirmCancel">取消</button><button class="btn btn-primary" id="confirmAccept">确认继续</button></div></dialog>
+<dialog class="workbench-dialog" id="infoDialog" aria-labelledby="infoTitle"><div class="dialog-heading"><h2 id="infoTitle">查看详情</h2><button class="btn btn-icon" onclick="document.getElementById('infoDialog').close()" aria-label="关闭详情">×</button></div><div class="dialog-body"><pre id="infoContent"></pre></div></dialog>
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -124,7 +158,7 @@ drop.addEventListener("drop", ev => uploadFiles(ev.dataTransfer.files));
 
 async function uploadFiles(files) {
   for (const f of files) {
-    const form = new FormData(); form.append("file", f);
+    const form = new FormData(); form.append("file", f); form.append("domain", $("#domain").value); form.append("auto_run", String($("#autoRun").checked));
     const r = await fetch("/api/upload?interactive=true", { method:"POST", body:form });
     if (!r.ok) { alert((await r.json()).detail || "上传失败"); continue; }
     const j = await r.json(); selectJob(j.job_id);
@@ -221,7 +255,7 @@ function renderWorkflow() {
     html = `<div class="workflow-msg info">文件已上传，请点击下方按钮开始解析。</div>
       <div class="workflow-actions"><button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/parse')">开始解析</button></div>`;
   } else if (stage === "parsing") {
-    html = modelPanel(null, "MinerU 解析引擎", "GPU 加速的 PDF 版面分析 + OCR + 表格识别 + 语义分块", ["pipeline 后端", "modelscope 本地权重"])
+    html = modelPanel(null, "文档解析", "识别页面布局、文字、表格和图片，建立可追溯的内容块。", [])
       + `<div class="workflow-msg info">正在解析…</div>` + timerHtml();
   } else if (stage === "parsed") {
     html = `<div class="workflow-msg success">解析完成：${j.chunks_count||0} 个分块</div>
@@ -235,12 +269,12 @@ function renderWorkflow() {
   } else if (stage === "prompt_ready") {
     html = planPanel(j);
   } else if (stage === "extracting") {
-    html = modelPanel("A", "Model A — 知识抽取模型", "按确认的蓝图逐章节抽取结构化记录（herb_table / general_rule / interaction / pregnancy 模板）", ["Extract LLM", `${j.chunks_count||"?"} chunks`])
+    html = modelPanel("A", "知识抽取", "按确认的章节方案抽取文字、表格与图片中的结构化知识，并保留来源。", [`${j.chunks_count||"?"} 个内容块`])
       + `<div class="workflow-msg info">正在调用 Model A 逐章节抽取…</div>` + timerHtml();
   } else if (stage === "extracted") {
     html = `<div class="workflow-msg success">抽取完成：${j.records_count||0} 条记录</div>
       <div class="workflow-actions">
-        <button class="btn" onclick="showCompare()">查看对比（原文 vs 抽取）</button>
+        <button class="btn" onclick="showCompare()">查看知识与来源证据</button>
         <button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/verify')">校验核对 <span class="model-tag mt-b">B</span></button>
       </div><div id="viewBox"></div>`;
   } else if (stage === "verifying") {
@@ -276,7 +310,7 @@ function planPanel(j) {
   const confirmed = j.prompt_confirmed;
   return `<div id="planBox"><div class="workflow-msg info">蓝图加载中…</div></div>
     <div class="workflow-actions" style="padding:12px;background:#f8f9fa;border-radius:8px">
-      <button class="btn" onclick="post('/api/jobs/${j.job_id}/step/generate-prompt')">重新生成蓝图</button>
+      <button class="btn" onclick="regenPlan()">重新生成蓝图</button>
       ${confirmed
         ? `<span class="badge done">方案已确认</span><button class="btn btn-primary" onclick="post('/api/jobs/${j.job_id}/step/extract')">开始抽取 <span class="model-tag mt-a">A</span></button>`
         : `<button class="btn btn-primary" onclick="confirmPlan()">确认方案，允许抽取</button>`}
@@ -285,61 +319,153 @@ function planPanel(j) {
 async function loadPlan() {
   const j = current; if (!j || j.workflow_stage !== "prompt_ready") return;
   const box = $("#planBox"); if (!box || box.dataset.loaded) return;
-  const s = await (await fetch(`/api/jobs/${j.job_id}/schema`)).json();
+  box.dataset.loaded = "loading";
+  let s;
+  try {
+    const response = await fetch(`/api/jobs/${j.job_id}/schema`);
+    s = await response.json();
+    if (!response.ok) throw new Error(s.detail || "蓝图加载失败");
+  } catch (error) {
+    if (current?.job_id === j.job_id && box.isConnected) {
+      box.dataset.loaded = "error";
+      box.innerHTML = `<div class="workflow-msg error">${esc(error.message)} <button class="btn" onclick="delete document.getElementById('planBox').dataset.loaded;loadPlan()">重试</button></div>`;
+    }
+    return;
+  }
+  if (current?.job_id !== j.job_id || !box.isConnected) return;
   box.dataset.loaded = "1";
-  const extOpts = (s.available_extractors||[]).map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join("");
-  const tplOpts = (s.available_templates||[]).map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join("");
+  renderPlanTable(s, !!j.prompt_confirmed);
+}
+function renderPlanTable(s, frozen) {
+  const box = $("#planBox"); if (!box) return;
+  const extLabels = s.extractor_labels || {};
+  const tplLabels = s.template_labels || {};
+  const extOpts = (s.available_extractors||[]).map(x=>`<option value="${esc(x)}">${esc(extLabels[x]||x)}</option>`).join("");
+  const overrides = (s.editable_sections||[]).filter(x=>x.mode!=="auto").length;
   const rows = (s.editable_sections||[]).map(x => {
-    const sid = esc(x.section_id);
-    const curExt = (s.available_extractors||[]).includes(x.extractor) ? "" : `<option value="${esc(x.extractor)}" selected>${esc(x.extractor)||"（空）"}</option>`;
-    const curTpl = (s.available_templates||[]).includes(x.template) ? "" : `<option value="${esc(x.template)}" selected>${esc(x.template)||"（空）"}</option>`;
-    return `<tr data-sid="${sid}">
-      <td title="${esc(x.title)}">${esc((x.title||"").slice(0,26))}</td>
-      <td><select class="pl-ext" ${x.skip?"disabled":""}>${curExt}<option value="">（不抽取）</option>${extOpts}</select></td>
-      <td><select class="pl-tpl" ${x.skip?"disabled":""}>${curTpl}<option value="">（无）</option>${tplOpts}</select></td>
-      <td style="text-align:center"><input type="checkbox" class="pl-skip" ${x.skip?"checked":""}></td></tr>`;
+    const depth = (x.heading_path||[]).length;
+    const cat = /^【.*】$/.test(x.title||"");
+    const trAttr = `data-sid="${esc(x.section_id)}" data-title="${esc(x.title)}" data-ct="${esc(x.content_type||"")}"`;
+    const title = `<span style="padding-left:${Math.min(depth,4)*14}px">${esc((x.title||"").slice(0,26))}</span>`;
+    const typeCell = `${esc(x.content_type_label||"—")}${x.skip_kind
+      ? ` <span class="badge ${x.skip_kind==="manual"?"run":"done"}" title="${esc(x.skip_reason||"")}">${x.skip_kind==="manual"?"人工跳过":"自动跳过"}</span>` : ""}`;
+    const loc = (x.page_start!=null||x.page_end!=null)
+      ? `p${x.page_start==null?"—":x.page_start}–${x.page_end==null?"—":x.page_end} · ${x.block_count} 块`
+      : `${x.block_count} 块`;
+    const routeTxt = x.extractor ? `${esc(extLabels[x.extractor]||x.extractor)} · ${esc(tplLabels[x.template]||x.template)}` : "—";
+    if (frozen) {
+      const modeBadge = x.mode==="skip" ? '<span class="badge run">强制跳过</span>'
+        : x.mode==="extract" ? '<span class="badge">强制抽取</span>'
+        : '<span class="badge done">自动</span>';
+      return `<tr ${trAttr}${cat?' class="pl-cat"':""}>
+        <td title="${esc(x.title)}">${title}</td><td>${typeCell}</td><td>${loc}</td>
+        <td style="text-align:center">${modeBadge}</td><td>${routeTxt}</td></tr>`;
+    }
+    const curExt = (s.available_extractors||[]).includes(x.extractor) ? "" : `<option value="${esc(x.extractor)}" selected>${esc(x.extractor)}</option>`;
+    return `<tr ${trAttr} data-orig-mode="${esc(x.mode)}" data-orig-ext="${esc(x.extractor)}" data-derived-ext="${esc((x.derived||{}).extractor||"")}"${cat?' class="pl-cat"':""}>
+      <td style="text-align:center"><input type="checkbox" class="pl-sel"></td>
+      <td title="${esc(x.title)}">${title}</td><td>${typeCell}</td><td>${loc}</td>
+      <td><select class="pl-mode">
+        <option value="auto"${x.mode==="auto"?" selected":""}${x.derived?"":" disabled"}>自动</option>
+        <option value="skip"${x.mode==="skip"?" selected":""}>强制跳过</option>
+        <option value="extract"${x.mode==="extract"?" selected":""}>强制抽取</option></select></td>
+      <td><span class="pl-route-txt"${x.mode==="extract"?' style="display:none"':""}>${routeTxt}</span>
+        <select class="pl-ext"${x.mode==="extract"?"":' disabled style="display:none"'}>${curExt}<option value="">（选抽取器）</option>${extOpts}</select></td></tr>`;
   }).join("");
-  box.innerHTML = modelPanel("C", "书籍抽取蓝图（可编辑）", "章节 → 抽取器 / A 模板路由可人工调整；保存后重写 plan 产物。", [`${s.total_sections} 章节`, `${s.planned_sections} 可抽取`, esc(s.book_type||"")])
-    + `<div class="box"><h4>章节路由编辑</h4>
-      <table><tr><th>章节</th><th>抽取器</th><th>A 模板</th><th>跳过</th></tr>${rows||'<tr><td colspan=4>无章节</td></tr>'}</table>
-      <div class="workflow-actions"><button class="btn btn-primary" onclick="savePlan()">保存蓝图编辑</button>
-      <span class="hint">勾选「跳过」= 该章节不抽取；已确认且抽过取的书保存后下游记录作废，需重新抽取</span></div></div>
+  const typeChips = [...new Set((s.editable_sections||[]).map(x=>x.content_type_label).filter(Boolean))].map(l =>
+    `<button class="btn pl-chip" data-ct="${esc(l)}" onclick="toggleChip(this)">${esc(l)}</button>`).join("");
+  const toolbar = frozen ? `<div class="workflow-actions" style="margin:0 0 10px">
+      <button class="btn" onclick="unlockPlan()">解锁编辑</button>
+      <span class="hint">方案已确认，蓝图冻结只读；解锁将回退到「待确认方案」状态（阶段记录与产物保留）</span></div>`
+    : `<div class="workflow-actions" style="margin:0 0 8px;gap:6px">
+      <input class="inp" id="plFilter" placeholder="搜索章节…" oninput="filterPlanRows()">
+      <button class="btn" onclick="toggleAllRows(this)">全选</button>
+      <button class="btn" onclick="batchPlan('auto')">选中→恢复自动</button>
+      <button class="btn" onclick="batchPlan('skip')">选中→强制跳过</button></div>
+    <div class="workflow-actions" style="margin:0 0 10px;gap:6px">${typeChips||'<span class="hint">无类型筛选（缺少章节画像）</span>'}</div>`;
+  box.innerHTML = modelPanel("C", frozen ? "书籍抽取蓝图（已确认 · 只读）" : "书籍抽取蓝图（复核 · 可调整）",
+      "规划器按内容类型确定性路由（类型 → 抽取器 / A 模板）；处理方式可人工调整，保存后重写 plan 产物。",
+      [`${s.total_sections} 章节`, `${s.planned_sections} 可抽取`, overrides ? `${overrides} 处人工覆盖` : esc(s.book_type||"—")])
+    + `<div class="box"><h4>章节路由${frozen ? "（只读）" : "编辑"}</h4>${toolbar}
+      <table><tr>${frozen?"":"<th style='width:32px'></th>"}<th>章节</th><th>类型</th><th>页码 · 块数</th><th>处理方式</th><th>路由（抽取器 · A 模板）</th></tr>
+      ${rows||`<tr><td colspan=${frozen?5:6}>无章节</td></tr>`}</table>
+      ${frozen ? "" : `<div class="workflow-actions"><button class="btn btn-primary" onclick="savePlan()">保存蓝图编辑</button>
+      <span class="hint">「自动」跟随规划器；「强制跳过」不抽取；「强制抽取」需选抽取器（模板随之确定）。已抽取的书保存后作废下游记录，仅变更章节需重新调用 Model A（其余命中缓存）。</span></div>`}</div>
     <div class="box fold" onclick="togglePrompt()"><h4 style="margin:0">所选 A 模板正文（只读）</h4><span class="arr" id="promptArr">▶</span></div>
     <div id="promptBody" style="display:none"></div>
     ${(s.qa_rules||[]).length ? `<p class="hint">风险提示：${s.qa_rules.map(esc).join("；")}</p>` : ""}`;
-  // 跳过勾选联动禁用下拉；下拉选中值回填（当前值不在选项列表时补 option 已 selected）
-  box.querySelectorAll(".pl-skip").forEach(cb => cb.onchange = () => {
-    const tr = cb.closest("tr");
-    tr.querySelectorAll("select").forEach(sel => { sel.disabled = cb.checked; });
-    if (!cb.checked) { // 取消跳过时清掉「（不抽取）/（无）」占位选中
-      tr.querySelectorAll("select").forEach(sel => { if (!sel.value) sel.selectedIndex = 1; });
+  if (!frozen) {
+    box.querySelectorAll(".pl-mode").forEach(sel => sel.onchange = () => setRowMode(sel.closest("tr"), sel.value));
+    box.querySelectorAll("tr[data-sid]").forEach(tr => {
+      const x = (s.editable_sections||[]).find(v=>v.section_id===tr.dataset.sid);
+      if (x && x.mode==="extract" && x.extractor) {
+        const e = tr.querySelector(".pl-ext"); if (e) e.value = x.extractor;
+      }
+    });
+  }
+}
+function setRowMode(tr, mode) {
+  const ext = tr.querySelector(".pl-ext"), txt = tr.querySelector(".pl-route-txt");
+  if (mode === "extract") {
+    ext.disabled = false; ext.style.display = ""; txt.style.display = "none";
+    if (!ext.value) {
+      const d = tr.dataset.derivedExt;
+      if (d && [...ext.options].some(o=>o.value===d)) ext.value = d;
+      else ext.value = ext.querySelector("option:not([value=''])")?.value || "";
     }
+  } else {
+    ext.disabled = true; ext.style.display = "none"; txt.style.display = "";
+  }
+}
+function filterPlanRows() {
+  const box = $("#planBox"); if (!box) return;
+  const q = ($("#plFilter")?.value||"").trim().toLowerCase();
+  const chips = [...box.querySelectorAll(".pl-chip.on")].map(c=>c.dataset.ct);
+  box.querySelectorAll("tr[data-sid]").forEach(tr => {
+    const ok = (!q || (tr.dataset.title||"").toLowerCase().includes(q)) && (!chips.length || chips.includes(tr.dataset.ct||""));
+    tr.style.display = ok ? "" : "none";
   });
-  box.querySelectorAll("select").forEach(sel => { if (sel.dataset.init) return; sel.dataset.init="1"; });
-  // 回填当前路由值
-  (s.editable_sections||[]).forEach(x => {
-    const tr = box.querySelector(`tr[data-sid="${CSS.escape(x.section_id)}"]`); if (!tr) return;
-    const e = tr.querySelector(".pl-ext"), t = tr.querySelector(".pl-tpl");
-    if (x.extractor) e.value = x.extractor;
-    if (x.template) t.value = x.template;
-  });
+}
+function toggleChip(btn) { btn.classList.toggle("on"); filterPlanRows(); }
+function toggleAllRows(btn) {
+  const box = $("#planBox"); if (!box) return;
+  const rows = [...box.querySelectorAll("tr[data-sid]")].filter(tr => tr.style.display !== "none");
+  const all = rows.length && rows.every(tr => tr.querySelector(".pl-sel").checked);
+  rows.forEach(tr => tr.querySelector(".pl-sel").checked = !all);
+  btn.textContent = all ? "全选" : "取消全选";
+}
+function batchPlan(mode) {
+  const box = $("#planBox"); if (!box) return;
+  const rows = [...box.querySelectorAll("tr[data-sid]")].filter(tr => tr.style.display !== "none" && tr.querySelector(".pl-sel").checked);
+  if (!rows.length) { alert("请先勾选要操作的章节（可先筛选后「全选」）"); return; }
+  rows.forEach(tr => { tr.querySelector(".pl-mode").value = mode; setRowMode(tr, mode); });
 }
 async function savePlan() {
   const j = current; if (!j) return;
   const box = $("#planBox");
-  const sections = [...box.querySelectorAll("tr[data-sid]")].map(tr => ({
+  const changed = [...box.querySelectorAll("tr[data-sid]")].map(tr => ({
     section_id: tr.dataset.sid,
+    orig_mode: tr.dataset.origMode, orig_ext: tr.dataset.origExt,
+    mode: tr.querySelector(".pl-mode").value,
     extractor: tr.querySelector(".pl-ext").value,
-    template: tr.querySelector(".pl-tpl").value,
-    skip: tr.querySelector(".pl-skip").checked,
-  }));
-  if (!confirm("保存蓝图编辑？已确认且抽过取的书，下游抽取/校验记录将被作废（产物保留）。")) return;
+  })).filter(x => x.mode !== x.orig_mode || (x.mode==="extract" && x.extractor !== x.orig_ext));
+  if (!changed.length) { alert("没有检测到改动"); return; }
+  if (changed.some(x => x.mode === "extract" && !x.extractor)) { alert("有「强制抽取」章节未选择抽取器，请补全后再保存"); return; }
+  const warn = j.has_extract
+    ? `\n本书已抽取 ${j.records_count||0} 条记录：保存后将作废抽取/校验记录，仅变更章节需重新调用 Model A（其余命中缓存）。` : "";
+  if (!await confirmAction(`保存蓝图编辑？共 ${changed.length} 处改动。${warn}`)) return;
   const r = await fetch(`/api/jobs/${j.job_id}/schema`, {
-    method: "PUT", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ sections }),
+    method: "PUT", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ sections: changed.map(x=>({ section_id: x.section_id, mode: x.mode, extractor: x.extractor })) }),
   });
   if (!r.ok) { alert((await r.json().catch(()=>({}))).detail || "保存失败"); return; }
   box.dataset.loaded = "";
   await refresh();
+}
+async function unlockPlan() {
+  const j = current; if (!j) return;
+  if (!await confirmAction("解锁编辑？将回退到待确认方案；保存修改后需重新处理下游记录。")) return;
+  await post(`/api/jobs/${j.job_id}/workflow/goto-prompt`);
 }
 async function togglePrompt() {
   const body = $("#promptBody"); if (!body) return;
@@ -348,10 +474,44 @@ async function togglePrompt() {
     if (!body.dataset.loaded) {
       body.innerHTML = '<div class="workflow-msg info">加载中…</div>';
       const d = await (await fetch(`/api/jobs/${current.job_id}/prompt`)).json();
-      body.innerHTML = `<div class="hint">${esc(d.note)}</div><pre>${esc(d.prompt)}</pre>`;
+      const adapts = d.adaptations || [];
+      const cards = adapts.map(a =>
+        `<div class="box" style="border-left:3px solid #4a9"><h4>每书适配（可人工编辑）· ${esc(a.template)}${a.degraded ? '（降级）' : ''}${a.human_edited ? ' <span class="badge run">人工已编辑</span>' : ''}</h4>`
+        + `<textarea id="adapt-${esc(a.template)}" rows="6" style="width:100%;font-family:monospace">${esc(a.block)}</textarea>`
+        + `<div class="workflow-actions"><button class="btn" onclick="saveAdaptation('${esc(a.template)}')">保存适配块</button></div></div>`
+      ).join("");
+      const degraded = adapts.some(a => a.degraded)
+        ? '<div class="hint">部分模板适配块生成失败，已降级为仅用 base 模板。</div>' : "";
+      const canRegen = current && current.status === "WAITING_PLAN_CONFIRMATION";
+      const regen = canRegen
+        ? `<div class="workflow-actions" style="margin-top:8px"><button class="btn" onclick="regenerateAdaptation()">重新生成适配</button></div>` : "";
+      body.innerHTML = `<div class="hint">${esc(d.note)}</div>${degraded}${cards}${regen}<pre>${esc(d.prompt)}</pre>`;
       body.dataset.loaded = "1";
     }
   } else { body.style.display = "none"; $("#promptArr").textContent = "▶"; }
+}
+async function regenerateAdaptation() {
+  const j = current; if (!j) return;
+  if (!await confirmAction("重新生成本书适配块？当前适配块缓存将作废，重新生成后需要确认。")) return;
+  const body = $("#promptBody"); if (body) { body.dataset.loaded = ""; body.style.display = "none"; const arr = $("#promptArr"); if (arr) arr.textContent = "▶"; }
+  await post(`/api/jobs/${j.job_id}/adaptations/regenerate`);
+}
+async function saveAdaptation(tpl) {
+  const j = current; if (!j) return;
+  const ta = document.getElementById(`adapt-${tpl}`); if (!ta) return;
+  if (!await confirmAction(`保存「${tpl}」适配块？若已抽取，需重新处理下游记录。`)) return;
+  const r = await fetch(`/api/jobs/${j.job_id}/adaptations`, {
+    method: "PUT", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ adaptations: [{ template: tpl, block: ta.value }] }),
+  });
+  if (!r.ok) { alert((await r.json().catch(()=>({}))).detail || "保存失败"); return; }
+  const body = $("#promptBody"); if (body) body.dataset.loaded = "";
+  await refresh();
+}
+async function regenPlan() {
+  const j = current; if (!j) return;
+  if (!await confirmAction("重新生成抽取蓝图？将重置方案及下游阶段，需要重新处理。")) return;
+  await post(`/api/jobs/${j.job_id}/workflow/retry-prompt`);
 }
 
 function controls(stage) {
@@ -370,17 +530,17 @@ async function stepClick(key, isBack) {
   if (key === "export") { doExport(); return; }
   // 点击更早的步骤节点 = 仅回退查看该步（无损：阶段记录与产物全部保留）
   if (isBack) {
-    if (!confirm(`跳转到「${STEP_LABEL[key] || key}」查看？仅回退当前步骤，已有阶段记录与产物全部保留；点「重新X」才会作废并重跑。`)) return;
+    if (!await confirmAction(`回退到「${STEP_LABEL[key] || key}」？已有产物保留。`)) return;
     await post(`/api/jobs/${j.job_id}/workflow/goto-${key}`);
     return;
   }
   // 点击当前步骤节点 = 执行 / 重跑该步（作废该步及下游记录后重新生成）
-  if (!confirm(`${RETRY_LABEL[key]}？该步骤及下游的阶段记录将被作废并重新生成（产物文件保留可回看）。`)) return;
+  if (!await confirmAction(`${RETRY_LABEL[key]}？该步骤及下游需要重新处理，兼容的缓存可复用。`)) return;
   await post(`/api/jobs/${j.job_id}/workflow/retry-${key}`);
 }
 async function goBack() {
   const j = current; if (!j) return;
-  if (!confirm("返回上一步？仅回退步骤状态，已有阶段记录与产物全部保留；点「重新X」才会作废并重跑。")) return;
+  if (!await confirmAction("返回上一步？仅回退步骤状态，已有阶段记录与产物保留。")) return;
   await post(`/api/jobs/${j.job_id}/workflow/back`);
 }
 async function doExport() {
@@ -405,8 +565,10 @@ function openView(html) {
   box.innerHTML = html; box.scrollIntoView({ behavior:"smooth", block:"nearest" });
 }
 async function showParsed() {
+  const id = current.job_id;
   openView('<div class="workflow-msg info">加载中…</div>');
-  const d = await (await fetch(`/api/jobs/${current.job_id}/parsed`)).json();
+  const d = await (await fetch(`/api/jobs/${id}/parsed`)).json();
+  if (current?.job_id !== id) return;
   openView(`<div class="box"><h4>解析结果 · ${d.chunks_count} 个内容块</h4><pre>${esc(d.text)}</pre></div>`);
 }
 async function showCompare() {
@@ -415,20 +577,23 @@ async function showCompare() {
   if (!r.ok) { openView(`<div class="workflow-msg error">${esc((await r.json()).detail||"加载失败")}</div>`); return; }
   const d = await r.json();
   const recs = (d.records||[]).map(r2 => `<tr><td>${esc(r2.record_id)}</td><td>${esc(r2.record_type)}</td>
-    <td>${esc(r2.herb_name||r2.subject_text||"")}</td><td>${esc((r2.raw_text||"").slice(0,80))}</td></tr>`).join("");
+    <td>${esc(r2.subject_text||r2.payload?.herb_name||"")}</td><td>${esc((r2.raw_text||"").slice(0,80))}</td></tr>`).join("");
   openView(`<div class="box"><h4>对比核对：${(d.records||[]).length} 条记录 / ${(d.chunks||[]).length} 个原文块</h4>
     <table><tr><th>记录ID</th><th>类型</th><th>主体</th><th>原文片段</th></tr>${recs||'<tr><td colspan=4>无记录</td></tr>'}</table></div>`);
 }
 let _qa = null; // 当前 QA 报告缓存
 async function showVerify() {
+  const id = current.job_id;
   openView('<div class="workflow-msg info">加载中…</div>');
-  const r = await fetch(`/api/jobs/${current.job_id}/verification`);
+  const r = await fetch(`/api/jobs/${id}/verification`);
+  if (current?.job_id !== id) return;
   if (!r.ok) { openView(`<div class="workflow-msg error">${esc((await r.json()).detail||"加载失败")}</div>`); return; }
   _qa = await r.json();
+  if (current?.job_id !== id) return;
   const d = _qa, st = d.stats || {};
   const cards = [
     [st.total ?? d.total, "总记录", "var(--pri)"],
-    [((st.pass_rate ?? 1) * 100).toFixed(1) + "%", "通过率", "var(--ok)"],
+    [st.pass_rate == null ? "—" : (st.pass_rate * 100).toFixed(1) + "%", "核验通过率", "var(--ok)"],
     [d.error_count, "ERROR", "var(--err)"],
     [d.warning_count, "WARNING", "var(--warn)"],
     [st.correction_count ?? 0, "纠错建议", "var(--warn)"],
@@ -488,11 +653,11 @@ function renderQaCorr() {
     <td>${esc(c.verdict)}</td><td>${c.applied ? '<span class="badge done">已应用</span>' : '<span class="badge run">待应用</span>'}</td></tr>`).join("");
   const pending = cor.filter(c => !c.applied).length;
   $("#qaCorr").innerHTML = `<div class="workflow-msg ${pending ? "warn" : "success"}">纠错覆盖：已应用 ${st.applied_count||0} / 共 ${cor.length} 条建议${pending ? `，待应用 ${pending} 条` : ""}。应用后覆盖写回核验记录，需重新导出 Excel 生效。</div>
-    ${rows ? `<table><tr><th>记录</th><th>字段</th><th>原值</th><th>B 建议</th><th>判定</th><th>状态</th></tr>${rows}</table>` : '<div class="workflow-msg success">所有记录均通过 Model B 校验，无需纠正。</div>'}
+    ${rows ? `<table><tr><th>记录</th><th>字段</th><th>原值</th><th>B 建议</th><th>判定</th><th>状态</th></tr>${rows}</table>` : '<div class="workflow-msg info">暂无可应用的纠错建议，请结合问题列表和原文继续核对。</div>'}
     ${pending ? `<div class="workflow-actions"><button class="btn btn-primary" onclick="applyCorrections()">应用纠错并覆盖核验记录 (${pending})</button></div>` : ""}`;
 }
 async function applyCorrections() {
-  if (!confirm("应用全部待应用纠错建议？将覆盖写回核验记录（原值保留在 correction_log）。")) return;
+  if (!await confirmAction("应用全部待应用纠错建议？将更新核验记录并保留修改日志。")) return;
   const r = await fetch(`/api/jobs/${current.job_id}/step/apply-corrections`, { method:"POST" });
   const d = await r.json().catch(()=>({}));
   if (!r.ok) { alert(d.detail || "应用失败"); return; }
@@ -529,14 +694,14 @@ function renderGepa(d) {
     const books = (r.book_ids || []).join(", ") || r.book_id || "-";
     const fit = `${_num(r.baseline_fitness, 3)} → ${_num(r.best_fitness, 3)}`;
     const badge = r.promoted ? '<span class="badge done">已晋升</span>'
-      : (r.improved ? '<span class="badge">可晋升</span>' : '<span class="badge run">未提升</span>');
+      : (r.improved ? '<span class="badge">评分提升 · 待评估</span>' : '<span class="badge run">未提升</span>');
     const dis = r.promoted ? "disabled" : "";
     const mode = r.mode === "flywheel" ? ' <span class="badge">跨书</span>' : "";
     return `<tr><td>${esc(r.template)}${mode}</td><td title="${esc(books)}">${esc(books.slice(0, 40))}</td>
       <td>${esc(r.run_id)}</td><td>${fit} ${badge}</td>
       <td>${r.total_generations || 0}代 / ${r.eval_calls || 0}评 / ${r.total_tokens || 0}tk</td>
-      <td><button class="btn" ${dis} onclick="previewPromote('${esc(r.run_dir)}','${esc(r.template)}')">预览</button>
-        <button class="btn btn-primary" ${dis} onclick="doPromote('${esc(r.run_dir)}','${esc(r.template)}')">晋升</button></td></tr>`;
+      <td><button class="btn" ${dis} onclick="previewPromote(${esc(JSON.stringify(r.run_dir))},${esc(JSON.stringify(r.template))})">预览</button>
+        <button class="btn btn-primary" ${dis} onclick="doPromote(${esc(JSON.stringify(r.run_dir))},${esc(JSON.stringify(r.template))})">应用候选</button></td></tr>`;
   }).join("");
   box.innerHTML = `<div class="stats">${stats}</div>
     <div class="box"><h4>质量趋势 · best fitness（旧→新）</h4>${gepaSparkline(d.runs)}</div>
@@ -579,7 +744,7 @@ async function previewPromote(runDir, template) {
   alert(`【预览 · 未落盘】\n模板：${d.template}\n版本：${d.old_version} → ${d.new_version}${d.version_bumped ? "（将 bump）" : "（无变化）"}\n路径：${d.prompts_path}\n\n${blk}`);
 }
 async function doPromote(runDir, template) {
-  if (!confirm(`确认晋升该进化产物到 prompts/a/${template}？\n这会 bump 模板版本，需随后对相关书 rerun --from extract 才作用于线上抽取。`)) return;
+  if (!await confirmAction(`应用候选提示词 ${template}？模板版本会更新，已有书籍需重新抽取才会使用新版本。`)) return;
   const d = await gepaPost({ run_dir: runDir, template, reviewer: gepaReviewer(), dry_run: false });
   if (!d) return;
   if (!d.changed) { alert("模板无变化，未晋升。"); return; }
@@ -605,7 +770,7 @@ function managePolling() {
 }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
-refresh(); loadGepa(); setInterval(() => { if (!_fast) refresh(); }, 4000);
 </script>
+<script src="/static/workbench.js"></script>
 </body>
 </html>

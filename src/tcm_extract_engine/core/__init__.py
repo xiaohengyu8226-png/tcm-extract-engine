@@ -15,7 +15,7 @@ from tcm_extract_engine.core.manifest import (
     BookStatus,
     StageRecord,
 )
-from tcm_extract_engine.core.records import RecordType, SafetyRule, SourceRecord
+from tcm_extract_engine.core.records import SafetyRule, SourceRecord
 
 __all__ = [
     "MANIFEST_FILENAME",
@@ -24,7 +24,6 @@ __all__ = [
     "BookManifest",
     "BookStatus",
     "BookWorkspace",
-    "RecordType",
     "SafetyRule",
     "SourceRecord",
     "StageRecord",

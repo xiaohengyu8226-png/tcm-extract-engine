@@ -24,7 +24,6 @@ B 的职责（严格隔离）：
 from __future__ import annotations
 
 import asyncio
-import enum
 import hashlib
 import json
 import logging
@@ -36,8 +35,18 @@ from pydantic import BaseModel, Field, ValidationError
 
 from tcm_extract_engine.cab.planner import PromptTemplateRegistry
 from tcm_extract_engine.cab.profiler import load_blocks
-from tcm_extract_engine.core.llm import UnifiedLLMClient
+from tcm_extract_engine.common.concurrency import get_verify_semaphore
+from tcm_extract_engine.core.llm import (
+    ImageContent,
+    LLMError,
+    TextContent,
+    UnifiedLLMClient,
+    is_truncation_error,
+)
 from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.core.verdict import Verdict
+from tcm_extract_engine.core.vision import ImageLoader
+from tcm_extract_engine.domains import get_domain_pack
 
 logger = logging.getLogger(__name__)
 
@@ -50,33 +59,23 @@ MAX_SOURCE_CHARS_PER_RECORD = 24_000
 # B 阶段系统提示
 _SYSTEM_PROMPT_B = "你是抽取结果核验器（Verifier）。严格按指令输出 JSON。"
 
-# 需要人工复核的 verdict
-_REVIEW_VERDICTS = frozenset({
-    "UNSUPPORTED",
-    "MISSING",
-    "WRONG_DOSE",
-    "WRONG_RELATION",
-    "WRONG_NORMALIZATION",
-    "OCR_UNCERTAIN",
-})
+# 需要人工复核的 verdict 子集由领域包声明（manifest.review_verdicts）
 
 # 记录中不参与 B 修正比对的字段（流水线管理字段，非事实内容）
-_NON_FACTUAL_FIELDS = frozenset({
-    "record_id", "book_id", "source", "confidence", "needs_review", "ambiguities",
-})
-
-
-class Verdict(str, enum.Enum):
-    """B 核验判定。"""
-
-    SUPPORTED = "SUPPORTED"
-    PARTIAL = "PARTIAL"
-    UNSUPPORTED = "UNSUPPORTED"
-    MISSING = "MISSING"
-    WRONG_DOSE = "WRONG_DOSE"
-    WRONG_RELATION = "WRONG_RELATION"
-    WRONG_NORMALIZATION = "WRONG_NORMALIZATION"
-    OCR_UNCERTAIN = "OCR_UNCERTAIN"
+_NON_FACTUAL_FIELDS = frozenset(
+    {
+        "record_id",
+        "book_id",
+        "domain_id",
+        "schema_version",
+        "generation",
+        "source",
+        "confidence",
+        "needs_review",
+        "ambiguities",
+        "passthrough",
+    }
+)
 
 
 _VERDICT_MAP: dict[str, Verdict] = {v.value: v for v in Verdict}
@@ -90,6 +89,7 @@ class VerificationResult(BaseModel):
     evidence_quote: str | None = None  # B 引用的原文依据
     explanation: str | None = None
     issues: list[dict[str, Any]] = Field(default_factory=list)  # B 报告的字段问题
+    needs_review: bool = False
 
 
 class CorrectionEntry(BaseModel):
@@ -108,6 +108,7 @@ class VerificationReport(BaseModel):
     """verify_records 输出（06_verify 主体）。"""
 
     total: int = 0
+    domain_id: str = "tcm"
     results: list[VerificationResult] = Field(default_factory=list)
     corrections: list[CorrectionEntry] = Field(default_factory=list)
 
@@ -119,7 +120,8 @@ class VerificationReport(BaseModel):
 
     @property
     def needs_review_count(self) -> int:
-        return sum(1 for r in self.results if r.verdict.value in _REVIEW_VERDICTS)
+        review = get_domain_pack(self.domain_id).review_verdicts
+        return sum(1 for r in self.results if r.needs_review or r.verdict.value in review)
 
     def summary(self) -> str:
         counts = self.verdict_counts()
@@ -147,6 +149,8 @@ async def verify_records(
     batch_size: int = VERIFIER_BATCH_SIZE,
     cache_dir: Path | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    vision_client: UnifiedLLMClient | None = None,
+    pack: Any = None,
 ) -> VerificationReport:
     """对全部记录执行 Model B 核验。
 
@@ -163,8 +167,13 @@ async def verify_records(
     Raises:
         VerificationError: 有批次在重试后仍失败（成功批次已缓存）。
     """
+    pack = pack or get_domain_pack(records[0].domain_id if records else "tcm")
     registry = registry or PromptTemplateRegistry()
     template = registry.load("b", "factual_verifier.md")
+    # 默认走 verify 专属闸门（VERIFY_CONCURRENCY）：不传时会退到全局 LLM 信号量
+    # （LLM_CONCURRENCY=200），全部批次一次性超发给只有数个槽位的本地校验服务，
+    # 服务端排队时间计入客户端超时，引发「超时→重排队尾→再超时」空转。
+    semaphore = semaphore or get_verify_semaphore()
 
     blocks = load_blocks(blocks_path)
     blocks_by_id = {str(b.get("blockid")): b for b in blocks}
@@ -173,20 +182,48 @@ async def verify_records(
     # 1) 原文定位：优先 section 标题，回退 block_ids
     verifiable: list[tuple[SourceRecord, str]] = []
     results: list[VerificationResult] = []
+    visual_records: list[SourceRecord] = []
     for record in records:
+        if record.domain_id != pack.id:
+            raise VerificationError("核验记录与领域包不匹配")
+        if record.passthrough:
+            # 表格直通：原表逐字透传，天然保真，不送 B 核验
+            results.append(
+                VerificationResult(
+                    record_id=record.record_id,
+                    verdict=Verdict.PASSTHROUGH,
+                    explanation="表格直通记录（原表逐行透传，免 LLM 核验）",
+                )
+            )
+            continue
+        if record.record_type == "FIGURE":
+            if vision_client is not None:
+                visual_records.append(record)
+            else:
+                results.append(
+                    VerificationResult(
+                        record_id=record.record_id,
+                        verdict=Verdict.FIGURE_REVIEW,
+                        explanation="未配置视觉核验客户端，转人工复核",
+                    )
+                )
+                record.needs_review = True
+            continue
         text = _source_for(record, sections_text, blocks_by_id)
         if text is None:
-            results.append(VerificationResult(
-                record_id=record.record_id,
-                verdict=Verdict.UNSUPPORTED,
-                explanation="无法定位原文（无 section/block 定位），未送 LLM 核验",
-            ))
+            results.append(
+                VerificationResult(
+                    record_id=record.record_id,
+                    verdict=Verdict.UNSUPPORTED,
+                    explanation="无法定位原文（无 section/block 定位），未送 LLM 核验",
+                )
+            )
             record.needs_review = True
         else:
             verifiable.append((record, text[:MAX_SOURCE_CHARS_PER_RECORD]))
 
     # 2) 分批
-    batches = [verifiable[i:i + batch_size] for i in range(0, len(verifiable), batch_size)]
+    batches = [verifiable[i : i + batch_size] for i in range(0, len(verifiable), batch_size)]
     total_batches = len(batches)
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -194,17 +231,42 @@ async def verify_records(
 
     async def _run_batch(batch: list[tuple[SourceRecord, str]]) -> dict[str, Any]:
         """返回 B 的原始响应 dict（由调用方解析）。"""
-        cache_key = _batch_cache_key(batch, template.version)
+        cache_key = _batch_cache_key(
+            batch, template.version + ":" + str(getattr(client, "cache_identity", getattr(client, "model", "")))
+        )
         if cache_dir is not None:
             cached = _load_batch_cache(cache_dir, cache_key, template.version)
             if cached is not None:
                 return cached
         payload = _build_payload(batch)
-        response = await client.complete_json(
-            system_prompt=_SYSTEM_PROMPT_B,
-            user_prompt=template.render(json.dumps(payload, ensure_ascii=False)),
-            semaphore=semaphore,
-        )
+        user_prompt = template.render(json.dumps(payload, ensure_ascii=False))
+        try:
+            response = await client.complete_json(
+                system_prompt=_SYSTEM_PROMPT_B,
+                user_prompt=user_prompt,
+                semaphore=semaphore,
+                max_retries=2,
+            )
+        except LLMError as exc:
+            # 思考型模型可能把输出预算全耗在推理链上（服务端 n_ctx 余量不足或
+            # 链长超 max_tokens），content 为空/JSON 截断；/no_think 指令在本部署
+            # 实测无效（推理仍跑满上限），重采样的链长分布也常落不进预算。
+            # 照 extractors 截断拆批的同款模式：递归拆半缩小单请求 prompt，
+            # 为思考链换余量；子批独立缓存，后续重跑直接命中。
+            if not (exc.kind == "empty" or is_truncation_error(exc)):
+                raise
+            if len(batch) <= 1:
+                raise
+            logger.warning(
+                "[Verifier] 批次撞输出预算 (%s)，拆半重试",
+                exc.kind,
+            )
+            mid = len(batch) // 2
+            left, right = await asyncio.gather(_run_batch(batch[:mid]), _run_batch(batch[mid:]))
+            response = {
+                **right,
+                "records": [*left.get("records", []), *right.get("records", [])],
+            }
         if cache_dir is not None:
             _save_batch_cache(cache_dir, cache_key, template.version, response)
         return response
@@ -217,9 +279,7 @@ async def verify_records(
             on_progress(done_count, total_batches)
         return result
 
-    gathered = await asyncio.gather(
-        *(_tracked(b) for b in batches), return_exceptions=True
-    )
+    gathered = await asyncio.gather(*(_tracked(b) for b in batches), return_exceptions=True)
 
     failures: list[str] = []
     batch_results: list[dict[str, Any]] = []
@@ -235,6 +295,64 @@ async def verify_records(
             + " | ".join(failures[:5])
         )
 
+    async def verify_image(record: SourceRecord) -> dict[str, Any]:
+        assert vision_client is not None
+        image_template = registry.load("b", "figure_verifier.md")
+        paths = list(
+            dict.fromkeys(
+                str(blocks_by_id[b].get("asset_path") or "")
+                for b in record.source.block_ids
+                if b in blocks_by_id
+            )
+        )
+        paths = [p for p in paths if p]
+        if not paths:
+            return {
+                "records": [
+                    {
+                        "record_id": record.record_id,
+                        "verdict": "FIGURE_REVIEW",
+                        "needs_human_review": True,
+                        "issues": [{"field": "image_ref", "problem": "原图来源无法定位"}],
+                    }
+                ]
+            }
+        contents: list[Any] = []
+        hashes: list[str] = []
+        for path in paths:
+            try:
+                contents.append(
+                    ImageContent(image_url={"url": ImageLoader.to_data_url(path, max_size=2048)})
+                )
+                hashes.append(ImageLoader.image_hash(path))
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise VerificationError(f"视觉核验无法加载原图: {path}") from exc
+        text = _source_for(record, sections_text, blocks_by_id) or ""
+        basis = _batch_cache_key(
+            [(record, text)],
+            image_template.version + str(hashes) + str(getattr(vision_client, "cache_identity", getattr(vision_client, "model", ""))),
+        )
+        if cache_dir is not None:
+            cached = _load_batch_cache(cache_dir, basis, image_template.version)
+            if cached is not None:
+                return cached
+        payload = _build_payload([(record, text)])
+        contents.insert(
+            0, TextContent(text=image_template.render(json.dumps(payload, ensure_ascii=False)))
+        )
+        response = await vision_client.complete_multimodal_json(
+            system_prompt=_SYSTEM_PROMPT_B,
+            user_contents=contents,
+            semaphore=semaphore,
+            max_retries=2,
+        )
+        if cache_dir is not None:
+            _save_batch_cache(cache_dir, basis, image_template.version, response)
+        return response
+
+    if visual_records:
+        batch_results.extend(await asyncio.gather(*(verify_image(r) for r in visual_records)))
+
     # 3) 解析 B 输出（按输入顺序稳定输出）
     records_by_id = {r.record_id: r for r in records}
     verified_ids: set[str] = set()
@@ -245,6 +363,12 @@ async def verify_records(
                 continue
             record_id = str(item.get("record_id") or "")
             record = records_by_id.get(record_id)
+            if record is None and record_id.startswith("SR-") and len(record_id) >= 16:
+                matches = [r for rid, r in records_by_id.items() if rid.startswith(record_id)]
+                if len(matches) == 1:
+                    record = matches[0]
+                    record_id = record.record_id
+                    item = {**item, "record_id": record_id}
             if record is None:
                 logger.warning("[Verifier] B 返回了未知 record_id: %s", record_id)
                 continue
@@ -257,18 +381,22 @@ async def verify_records(
     for record in records:
         if record.record_id not in verified_ids:
             if not any(r.record_id == record.record_id for r in results):
-                results.append(VerificationResult(
-                    record_id=record.record_id,
-                    verdict=Verdict.PARTIAL,
-                    explanation="B 未返回该记录的核验结果（漏答），转人工复核",
-                ))
+                results.append(
+                    VerificationResult(
+                        record_id=record.record_id,
+                        verdict=Verdict.PARTIAL,
+                        explanation="B 未返回该记录的核验结果（漏答），转人工复核",
+                        needs_review=True,
+                    )
+                )
                 record.needs_review = True
 
     report = VerificationReport(
-        total=len(records), results=results, corrections=all_corrections
+        total=len(records), domain_id=pack.id, results=results, corrections=all_corrections
     )
     logger.info("[Verifier] %s", report.summary())
     return report
+
 
 # ── 原文定位 ─────────────────────────────────────────────────────────────────
 
@@ -291,12 +419,11 @@ def _source_for(
     sections_text: dict[str, str],
     blocks_by_id: dict[str, dict[str, Any]],
 ) -> str | None:
-    """定位记录的核验原文：section 标题优先，回退 block_ids。"""
-    if record.source.section_path:
-        title = record.source.section_path[-1].strip()
-        text = sections_text.get(title)
-        if text:
-            return text
+    """定位记录的核验原文：block_ids 优先，回退 section 标题。
+
+    block_ids 是抽取时读到的确切块，对标题污染/大纲修复后的规范化标题都免疫；
+    section 标题查不到时才回退（老记录可能缺 block_ids）。
+    """
     if record.source.block_ids:
         parts = [
             str(blocks_by_id[b].get("content") or "")
@@ -305,6 +432,11 @@ def _source_for(
         ]
         if parts:
             return "\n".join(parts)
+    if record.source.section_path:
+        title = record.source.section_path[-1].strip()
+        text = sections_text.get(title)
+        if text:
+            return text
     return None
 
 
@@ -342,8 +474,11 @@ def _parse_result(
         verdict = Verdict.PARTIAL
 
     issues = [
-        {"field": str(i.get("field") or ""), "problem": str(i.get("problem") or ""),
-         "source_evidence": i.get("source_evidence")}
+        {
+            "field": str(i.get("field") or ""),
+            "problem": str(i.get("problem") or ""),
+            "source_evidence": i.get("source_evidence"),
+        }
         for i in (item.get("issues") or [])
         if isinstance(i, dict)
     ]
@@ -351,11 +486,15 @@ def _parse_result(
         f"{i['field']}: {i['problem']}" for i in issues if i["field"] or i["problem"]
     )
     if unknown_verdict:
-        explanation = (explanation + "; " if explanation else "") + \
-            f"verdict 无法解析: {verdict_raw!r}"
+        explanation = (
+            explanation + "; " if explanation else ""
+        ) + f"verdict 无法解析: {verdict_raw!r}"
 
-    needs_review = bool(item.get("needs_human_review")) or \
-        verdict.value in _REVIEW_VERDICTS or unknown_verdict
+    needs_review = (
+        bool(item.get("needs_human_review"))
+        or verdict.value in get_domain_pack(record.domain_id).review_verdicts
+        or unknown_verdict
+    )
     if needs_review:
         record.needs_review = True
 
@@ -365,6 +504,7 @@ def _parse_result(
         evidence_quote=item.get("source_evidence"),
         explanation=explanation or None,
         issues=issues,
+        needs_review=needs_review or record.needs_review,
     )
     corrections = _diff_corrections(record, item.get("corrected_record"), verdict)
     return result, corrections
@@ -380,33 +520,82 @@ def _diff_corrections(
     if not isinstance(corrected, dict) or not corrected:
         return []
     full = record.model_dump(mode="json")
-    base = {k: v for k, v in full.items() if k not in _NON_FACTUAL_FIELDS}
-    overrides = {
-        k: v for k, v in corrected.items()
-        if k in full and k not in _NON_FACTUAL_FIELDS
-    }
-    if not overrides:
-        return []
+    corrected = dict(corrected)
+    # TCM templates historically emit typed fields at top level; normalize only
+    # at the model-output boundary, never while loading serialized artifacts.
+    corrected = get_domain_pack(record.domain_id).normalize_correction(corrected)
+    overrides = {k: v for k, v in corrected.items() if k in {"payload", "subject_text", "raw_text"}}
+    if "payload" in overrides and isinstance(overrides["payload"], dict):
+        overrides["payload"] = _merge_dict(full["payload"], overrides["payload"])
     try:
-        merged = SourceRecord.model_validate({**full, **overrides})
-    except ValidationError as exc:
-        return [CorrectionEntry(
-            record_id=record.record_id, field="(record)",
-            original=None, suggested=corrected,
-            reason=f"B 修正未通过 SourceRecord 校验，转人工: {exc.error_count()} 处",
-            verdict=verdict,
-        )]
-    merged_dump = merged.model_dump(mode="json", exclude=_NON_FACTUAL_FIELDS)
-    entries = [
-        CorrectionEntry(
-            record_id=record.record_id, field=key,
-            original=base[key], suggested=merged_dump[key],
-            reason="B 依据原文建议修正（待人工确认后生效）",
-            verdict=verdict,
-        )
-        for key in base if base[key] != merged_dump[key]
-    ]
+        merged = SourceRecord.model_validate({**full, **overrides}).model_dump(mode="json")
+    except (ValidationError, ValueError) as exc:
+        return [
+            CorrectionEntry(
+                record_id=record.record_id,
+                field="(record)",
+                original=None,
+                suggested=corrected,
+                reason=f"B 修正未通过载荷校验，转人工: {exc}",
+                verdict=verdict,
+            )
+        ]
+    entries: list[CorrectionEntry] = []
+
+    def walk(old: Any, new: Any, path: str) -> None:
+        if isinstance(old, dict) and isinstance(new, dict):
+            for key in sorted(set(old) | set(new)):
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                walk(old.get(key), new.get(key), path + "/" + escaped)
+        elif old != new:
+            entries.append(
+                CorrectionEntry(
+                    record_id=record.record_id,
+                    field=path,
+                    original=old,
+                    suggested=new,
+                    reason="B 依据原文建议修正（待人工确认后生效）",
+                    verdict=verdict,
+                )
+            )
+
+    for key in overrides:
+        walk(full[key], merged[key], "/" + key)
     return entries
+
+
+def _merge_dict(base: dict, update: dict) -> dict:
+    return {
+        **base,
+        **{
+            k: _merge_dict(base[k], v)
+            if isinstance(v, dict) and isinstance(base.get(k), dict)
+            else v
+            for k, v in update.items()
+        },
+    }
+
+
+def apply_correction(record: SourceRecord, correction: CorrectionEntry) -> SourceRecord:
+    import copy
+
+    if correction.record_id != record.record_id or correction.field == "(record)":
+        raise ValueError("整条无效修正不能自动应用")
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in correction.field.split("/")[1:]]
+    if not parts or parts[0] not in {"payload", "subject_text", "raw_text"}:
+        raise ValueError("仅允许应用事实字段路径修正")
+    data = copy.deepcopy(record.model_dump(mode="json"))
+    target = data
+    for part in parts[:-1]:
+        if not isinstance(target.get(part), dict):
+            raise ValueError("无效修正路径")
+        target = target[part]
+    if target.get(parts[-1]) != correction.original:
+        raise ValueError("修正原值已变化，请重新核对")
+    target[parts[-1]] = correction.suggested
+    result = SourceRecord.model_validate(data)
+    result.needs_review = True
+    return result
 
 
 # ── 批级缓存 ─────────────────────────────────────────────────────────────────
@@ -415,17 +604,20 @@ def _diff_corrections(
 def _batch_cache_key(batch: list[tuple[SourceRecord, str]], template_version: str) -> str:
     """缓存键 = 记录内容 hash + 模板版本（记录内容变化即失效）。"""
     basis = "\n".join(
-        json.dumps(r.model_dump(mode="json", exclude=_NON_FACTUAL_FIELDS),
-                   ensure_ascii=False, sort_keys=True)
-        for r, _ in batch
+        json.dumps(
+            r.model_dump(mode="json", exclude=set(_NON_FACTUAL_FIELDS)),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        + "\nSOURCE:"
+        + text
+        for r, text in batch
     )
-    digest = hashlib.sha1(basis.encode()).hexdigest()[:12]
+    digest = hashlib.sha256((basis + "\nCONTEXT:" + template_version).encode()).hexdigest()[:24]
     return f"{digest}-{template_version[:8]}"
 
 
-def _load_batch_cache(
-    cache_dir: Path, key: str, template_version: str
-) -> dict[str, Any] | None:
+def _load_batch_cache(cache_dir: Path, key: str, template_version: str) -> dict[str, Any] | None:
     path = cache_dir / f"verify_{key}.json"
     if not path.is_file():
         return None

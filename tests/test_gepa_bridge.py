@@ -27,7 +27,7 @@ from tcm_extract_engine.cab.verifier import (
 )
 from tcm_extract_engine.core.artifacts import ArtifactHeader, save_artifact
 from tcm_extract_engine.core.llm import LLMUsage
-from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 from tcm_extract_engine.gepa.bridge import (
     ConstrainedTemplateRegistry,
     EvalOutcome,
@@ -71,9 +71,7 @@ class TestConstrainedTemplateRegistry:
 
     def test_空约束块等同基线(self) -> None:
         plain = PromptTemplateRegistry().load("a", "general_rule.md")
-        empty = ConstrainedTemplateRegistry("general_rule.md", "  ").load(
-            "a", "general_rule.md"
-        )
+        empty = ConstrainedTemplateRegistry("general_rule.md", "  ").load("a", "general_rule.md")
         assert empty.version == plain.version
 
 
@@ -89,11 +87,14 @@ def _rec(rid: str) -> SourceRecord:
 class TestVerdictToIssues:
     def test_verdict映射到issue类型与严重度(self) -> None:
         records = [_rec("SR-1"), _rec("SR-2"), _rec("SR-3")]
-        verification = VerificationReport(total=3, results=[
-            VerificationResult(record_id="SR-1", verdict=Verdict.SUPPORTED),
-            VerificationResult(record_id="SR-2", verdict=Verdict.UNSUPPORTED),
-            VerificationResult(record_id="SR-3", verdict=Verdict.WRONG_DOSE),
-        ])
+        verification = VerificationReport(
+            total=3,
+            results=[
+                VerificationResult(record_id="SR-1", verdict=Verdict.SUPPORTED),
+                VerificationResult(record_id="SR-2", verdict=Verdict.UNSUPPORTED),
+                VerificationResult(record_id="SR-3", verdict=Verdict.WRONG_DOSE),
+            ],
+        )
         issues = verdict_to_issues(records, verification, ValidationReport(total_records=3))
         types = {i["issue_type"] for i in issues}
         assert types == {"unsupported", "dosage_unit"}
@@ -103,25 +104,79 @@ class TestVerdictToIssues:
         # SUPPORTED 不产问题
         assert all(i["json_pointer"] != "/records/0" for i in issues)
 
-    def test_partial不计入问题(self) -> None:
+    def test_partial计入未充分核验问题(self) -> None:
         records = [_rec("SR-1")]
-        verification = VerificationReport(total=1, results=[
-            VerificationResult(record_id="SR-1", verdict=Verdict.PARTIAL),
-        ])
-        assert verdict_to_issues(records, verification, ValidationReport(total_records=1)) == []
-
-    def test_校验error计入_warning忽略(self) -> None:
-        records = [_rec("SR-1"), _rec("SR-2")]
-        validation = ValidationReport(total_records=2, issues=[
-            ValidationIssue(record_id="SR-1", category=IssueCategory.SOURCE,
-                            severity=Severity.ERROR, message="缺原文"),
-            ValidationIssue(record_id="SR-2", category=IssueCategory.COVERAGE,
-                            severity=Severity.WARNING, message="覆盖率提示"),
-        ])
-        issues = verdict_to_issues(records, VerificationReport(total=2), validation)
+        verification = VerificationReport(
+            total=1,
+            results=[
+                VerificationResult(record_id="SR-1", verdict=Verdict.PARTIAL),
+            ],
+        )
+        issues = verdict_to_issues(records, verification, ValidationReport(total_records=1))
         assert len(issues) == 1
-        assert issues[0]["issue_type"] == "unsupported"
-        assert issues[0]["json_pointer"] == "/records/0"
+        assert issues[0]["issue_type"] == "inconsistent"
+
+    def test_校验error与warning都计入_warning弱化(self) -> None:
+        records = [_rec("SR-1"), _rec("SR-2")]
+        validation = ValidationReport(
+            total_records=2,
+            issues=[
+                ValidationIssue(
+                    record_id="SR-1",
+                    category=IssueCategory.SOURCE,
+                    severity=Severity.ERROR,
+                    message="缺原文",
+                ),
+                ValidationIssue(
+                    record_id="SR-2",
+                    category=IssueCategory.COVERAGE,
+                    severity=Severity.WARNING,
+                    message="覆盖率提示",
+                ),
+            ],
+        )
+        issues = verdict_to_issues(records, VerificationReport(total=2), validation)
+        # ERROR 与 WARNING 都计入（WARNING 不再被完全忽略）
+        assert len(issues) == 2
+        err = next(i for i in issues if i["json_pointer"] == "/records/0")
+        warn = next(i for i in issues if i["json_pointer"] == "/records/1")
+        # ERROR 全强度：SOURCE→unsupported/high/0.95
+        assert (err["issue_type"], err["severity"], err["confidence"]) == (
+            "unsupported",
+            "high",
+            0.95,
+        )
+        # WARNING 弱化：COVERAGE→missing，严重度 medium→low，confidence 0.8×0.65=0.52
+        assert warn["issue_type"] == "missing"
+        assert warn["severity"] == "low"
+        assert warn["confidence"] == pytest.approx(0.52)
+        assert warn["confidence"] < err["confidence"]
+
+    def test_同记录error与warning同类别_error优先(self) -> None:
+        records = [_rec("SR-1")]
+        validation = ValidationReport(
+            total_records=1,
+            issues=[
+                ValidationIssue(
+                    record_id="SR-1",
+                    category=IssueCategory.ENTITY,
+                    severity=Severity.WARNING,
+                    message="弱：成员缺失",
+                ),
+                ValidationIssue(
+                    record_id="SR-1",
+                    category=IssueCategory.ENTITY,
+                    severity=Severity.ERROR,
+                    message="强：成员缺失",
+                ),
+            ],
+        )
+        issues = verdict_to_issues(records, VerificationReport(total=1), validation)
+        # ENTITY→missing 同类别，去重后只保留 ERROR（全强度，不被 WARNING 覆盖）
+        assert len(issues) == 1
+        assert issues[0]["severity"] == "medium"
+        assert issues[0]["confidence"] == 0.85
+        assert issues[0]["message"] == "强：成员缺失"
 
 
 class TestFeedbackText:
@@ -129,18 +184,43 @@ class TestFeedbackText:
         records = [_rec("SR-1")]
         verification = VerificationReport(
             total=1,
-            results=[VerificationResult(
-                record_id="SR-1", verdict=Verdict.UNSUPPORTED, explanation="action 无原文依据"
-            )],
-            corrections=[CorrectionEntry(
-                record_id="SR-1", field="action", original="PROHIBIT",
-                suggested="CAUTION", reason="原文为慎用", verdict=Verdict.UNSUPPORTED,
-            )],
+            results=[
+                VerificationResult(
+                    record_id="SR-1", verdict=Verdict.UNSUPPORTED, explanation="action 无原文依据"
+                )
+            ],
+            corrections=[
+                CorrectionEntry(
+                    record_id="SR-1",
+                    field="action",
+                    original="PROHIBIT",
+                    suggested="CAUTION",
+                    reason="原文为慎用",
+                    verdict=Verdict.UNSUPPORTED,
+                )
+            ],
         )
         text = build_feedback_text(records, verification, ValidationReport(total_records=1))
         assert "UNSUPPORTED" in text
         assert "action 无原文依据" in text
         assert "修正建议" in text
+
+    def test_反馈含warning弱信号(self) -> None:
+        records = [_rec("SR-1")]
+        validation = ValidationReport(
+            total_records=1,
+            issues=[
+                ValidationIssue(
+                    record_id="SR-1",
+                    category=IssueCategory.ENTITY,
+                    severity=Severity.WARNING,
+                    message="妊娠目标缺失",
+                ),
+            ],
+        )
+        text = build_feedback_text(records, VerificationReport(total=1), validation)
+        assert "VALIDATE-WARN" in text
+        assert "妊娠目标缺失" in text
 
 
 # ── 真实评估闭环（stub client）──────────────────────────────────────────────
@@ -162,15 +242,17 @@ class _StubClient:
         self.usage.input_tokens += 10
         self.usage.output_tokens += 5
         if "抽取引擎" in system_prompt:
-            return {"records": [
-                {
-                    "record_type": "GENERAL_RULE",
-                    "subject_text": "附子",
-                    "raw_text": "孕妇禁用附子，先煎三十分钟",
-                    "action": "PROHIBIT",
-                }
-                for _ in range(self._records_per_call)
-            ]}
+            return {
+                "records": [
+                    {
+                        "record_type": "GENERAL_RULE",
+                        "subject_text": f"附子-{idx}",
+                        "raw_text": "孕妇禁用附子，先煎三十分钟",
+                        "action": "PROHIBIT",
+                    }
+                    for idx in range(self._records_per_call)
+                ]
+            }
         # 核验：从 user_prompt 回捞 record_id，循环给 verdict
         ids = re.findall(r'"record_id":\s*"(SR-[^"]+)"', user_prompt)
         out = []
@@ -188,20 +270,32 @@ def _write_blocks(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps({"type": "meta", "total": 2})]
     for i in (1, 2):
-        lines.append(json.dumps({
-            "type": "content", "blockid": f"b{i}", "heading": "妊娠用药禁忌",
-            "content": f"孕妇禁用附子第{i}条，先煎三十分钟。",
-            "positions": [{"anchor": "10"}],
-        }, ensure_ascii=False))
+        lines.append(
+            json.dumps(
+                {
+                    "type": "content",
+                    "blockid": f"b{i}",
+                    "heading": "妊娠用药禁忌",
+                    "content": "孕妇禁用附子，先煎三十分钟。",
+                    "positions": [{"anchor": "10"}],
+                },
+                ensure_ascii=False,
+            )
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_plan(path: Path, book_id: str) -> None:
     section = {
-        "section_id": "s1", "title": "妊娠用药禁忌",
-        "heading_path": ["妊娠用药禁忌"], "extractor": "GeneralRuleExtractor",
-        "template": "general_rule.md", "prompt_version": "base",
-        "block_ids": ["b1", "b2"], "page_start": 10, "page_end": 10,
+        "section_id": "s1",
+        "title": "妊娠用药禁忌",
+        "heading_path": ["妊娠用药禁忌"],
+        "extractor": "GeneralRuleExtractor",
+        "template": "general_rule.md",
+        "prompt_version": "base",
+        "block_ids": ["b1", "b2"],
+        "page_start": 10,
+        "page_end": 10,
     }
     save_artifact(
         path,
@@ -268,8 +362,13 @@ async def test_evaluate_candidate_基线空约束块可跑(tmp_path: Path) -> No
 
 def _fit(score: float, **kw: Any) -> FitnessResult:
     return FitnessResult(
-        fitness=score, pass_rate=score, penalty_rate=1.0 - score,
-        missing_rate=0.0, hallucination_rate=0.0, issue_stats=IssueStats(), **kw,
+        fitness=score,
+        pass_rate=score,
+        penalty_rate=1.0 - score,
+        missing_rate=0.0,
+        hallucination_rate=0.0,
+        issue_stats=IssueStats(),
+        **kw,
     )
 
 
@@ -282,7 +381,9 @@ class _ReflectStub:
         self._boom = boom
         self.calls = 0
 
-    async def complete_json(self, *, system_prompt: str, user_prompt: str, **_: Any) -> dict[str, Any]:
+    async def complete_json(
+        self, *, system_prompt: str, user_prompt: str, **_: Any
+    ) -> dict[str, Any]:
         self.calls += 1
         if self._boom:
             raise RuntimeError("反思服务不可用")
@@ -298,7 +399,10 @@ class _NullGateway:
 
 def test_fold_outcome_补齐feedback与每实例分() -> None:
     outcome = EvalOutcome(
-        fitness=_fit(0.7), feedback="FB", per_instance_scores={"bk": 0.7}, total_records=1,
+        fitness=_fit(0.7),
+        feedback="FB",
+        per_instance_scores={"bk": 0.7},
+        total_records=1,
     )
     folded = fold_outcome_to_fitness(outcome)
     assert folded.fitness == 0.7
@@ -310,8 +414,9 @@ class TestReflectiveProposer:
     @pytest.mark.asyncio
     async def test_反思产出新约束块(self) -> None:
         parent = PromptIndividual(prompt_id="p0", extraction_prompt="", verification_prompt="")
-        fitness = _fit(0.5, feedback="[UNSUPPORTED] SR-1：action 无依据",
-                       top_issues=["unsupported"])
+        fitness = _fit(
+            0.5, feedback="[UNSUPPORTED] SR-1：action 无依据", top_issues=["unsupported"]
+        )
         proposer = make_reflective_proposer(
             llm_client=_ReflectStub("## 进化约束\n禁止编造原文不存在的剂量。"),
             target_template="general_rule.md",
@@ -338,7 +443,8 @@ class TestReflectiveProposer:
     async def test_反思失败回退静态变异(self) -> None:
         parent = PromptIndividual(prompt_id="p0", extraction_prompt="", verification_prompt="")
         proposer = make_reflective_proposer(
-            llm_client=_ReflectStub("", boom=True), target_template="general_rule.md",
+            llm_client=_ReflectStub("", boom=True),
+            target_template="general_rule.md",
         )
         child = await proposer(parent, _fit(0.4))
         assert not child.mutation_applied.startswith("reflect")  # 走了 mutate_prompt
@@ -347,7 +453,8 @@ class TestReflectiveProposer:
     async def test_反思无新意回退静态变异(self) -> None:
         parent = PromptIndividual(prompt_id="p0", extraction_prompt="SAME", verification_prompt="")
         proposer = make_reflective_proposer(
-            llm_client=_ReflectStub("SAME"), target_template="general_rule.md",
+            llm_client=_ReflectStub("SAME"),
+            target_template="general_rule.md",
         )
         child = await proposer(parent, _fit(0.4))
         assert not child.mutation_applied.startswith("reflect")
@@ -379,13 +486,16 @@ async def test_端到端_单模板小预算_pareto反思进化(tmp_path: Path) -
         population_size=2,
         max_generations=3,
         eval_sample_size=1,
-        convergence_threshold=1.5,      # 不可达，靠预算停
+        convergence_threshold=1.5,  # 不可达，靠预算停
         selection_strategy="pareto",
-        crossover_rate=0.0,             # 走反思变异
-        budget_metric_calls=4,          # 小预算：最多 4 次真实评估
+        crossover_rate=0.0,  # 走反思变异
+        budget_metric_calls=4,  # 小预算：最多 4 次真实评估
     )
     engine = GEPAEngine(
-        _NullGateway(), config, evaluate_fn=evaluate_fn, instruction_proposer=proposer,
+        _NullGateway(),
+        config,
+        evaluate_fn=evaluate_fn,
+        instruction_proposer=proposer,
     )
     seed = PromptIndividual(prompt_id="seed", extraction_prompt="", verification_prompt="")
     # evaluate_fn 忽略 chunks，占位 1 个即可绕过 optimize 的非空校验
@@ -399,8 +509,12 @@ async def test_端到端_单模板小预算_pareto反思进化(tmp_path: Path) -
 class TestSystemAwareMerger:
     @pytest.mark.asyncio
     async def test_合并产出兼顾双方的新块(self) -> None:
-        pa = PromptIndividual(prompt_id="a", extraction_prompt="约束A：剂量带单位", verification_prompt="")
-        pb = PromptIndividual(prompt_id="b", extraction_prompt="约束B：禁止臆测禁忌", verification_prompt="")
+        pa = PromptIndividual(
+            prompt_id="a", extraction_prompt="约束A：剂量带单位", verification_prompt=""
+        )
+        pb = PromptIndividual(
+            prompt_id="b", extraction_prompt="约束B：禁止臆测禁忌", verification_prompt=""
+        )
         merger = make_system_aware_merger(
             llm_client=_ReflectStub("约束A+B：剂量带单位且禁止臆测禁忌。", rationale="各取所长"),
             target_template="general_rule.md",
@@ -429,7 +543,8 @@ class TestSystemAwareMerger:
         pa = PromptIndividual(prompt_id="a", extraction_prompt="SAME", verification_prompt="")
         pb = PromptIndividual(prompt_id="b", extraction_prompt="SAME", verification_prompt="")
         merger = make_system_aware_merger(
-            llm_client=_ReflectStub("不应被调用"), target_template="general_rule.md",
+            llm_client=_ReflectStub("不应被调用"),
+            target_template="general_rule.md",
         )
         with pytest.raises(ValueError):
             await merger(pa, pb, _fit(0.5), _fit(0.5))
@@ -439,8 +554,8 @@ class TestSystemAwareMerger:
         pa = PromptIndividual(prompt_id="a", extraction_prompt="约束A", verification_prompt="")
         pb = PromptIndividual(prompt_id="b", extraction_prompt="约束B", verification_prompt="")
         merger = make_system_aware_merger(
-            llm_client=_ReflectStub(""), target_template="general_rule.md",
+            llm_client=_ReflectStub(""),
+            target_template="general_rule.md",
         )
         with pytest.raises(ValueError):
             await merger(pa, pb, _fit(0.5), _fit(0.5))
-

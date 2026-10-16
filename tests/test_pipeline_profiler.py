@@ -11,10 +11,10 @@ from tcm_extract_engine.cab.planner import (
     PromptTemplateRegistry,
     build_extraction_plan,
 )
-from tcm_extract_engine.cab.profiler import (
+from tcm_extract_engine.cab.profiler import build_profile
+from tcm_extract_engine.domains.tcm.classify import (
     ContentType,
     DocumentType,
-    build_profile,
     classify_section,
     infer_document_type,
 )
@@ -45,11 +45,15 @@ def test_classify_irrelevant() -> None:
 
 
 def test_classify_rule_by_body_text() -> None:
-    """无匹配标题时按正文措辞密度分类。"""
+    """无匹配标题的正文章节：一律判叙述性规则走通用抽取器（止血兜底，不再丢弃）。"""
     body = "本品禁用。孕妇慎用。儿童不宜使用。不得过量。"
     assert classify_section("第四章 其他要求", body_text=body) == ContentType.NARRATIVE_RULE
-    # 正文无规则措辞 → REFERENCE_ONLY
-    assert classify_section("第四章 其他要求", body_text="本章介绍背景知识。") == ContentType.REFERENCE_ONLY
+    # 止血：正文无规则措辞也不再判 REFERENCE_ONLY 丢弃，改判 NARRATIVE_RULE 抽取，
+    # 避免非中医书（如西医临床正文）整章被静默丢掉；噪声交由校验/B核验/人工门兜底。
+    assert (
+        classify_section("第四章 其他要求", body_text="本章介绍背景知识。")
+        == ContentType.NARRATIVE_RULE
+    )
 
 
 def test_classify_table_fallback() -> None:
@@ -58,19 +62,13 @@ def test_classify_table_fallback() -> None:
 
 def test_table_priority_over_soft_keyword() -> None:
     """有表格时 STRUCTURED_TABLE 压过叙述性关键词（如「煎」）。"""
-    assert classify_section(
-        "需特殊煎煮中药目录", table_count=1
-    ) == ContentType.STRUCTURED_TABLE
+    assert classify_section("需特殊煎煮中药目录", table_count=1) == ContentType.STRUCTURED_TABLE
 
 
 def test_high_semantic_types_survive_table_priority() -> None:
     """禁忌/妊娠目录本身就是表格，不得被降级成 HerbTable 路由。"""
-    assert classify_section(
-        "附录C 十八反、十九畏", table_count=2
-    ) == ContentType.RELATION_GROUP
-    assert classify_section(
-        "妊娠禁用中药", table_count=1
-    ) == ContentType.ENTITY_GROUP_LIST
+    assert classify_section("附录C 十八反、十九畏", table_count=2) == ContentType.RELATION_GROUP
+    assert classify_section("妊娠禁用中药", table_count=1) == ContentType.ENTITY_GROUP_LIST
     assert classify_section("参考文献", table_count=1) == ContentType.IRRELEVANT
 
 
@@ -185,9 +183,10 @@ def test_build_extraction_plan(tmp_path: Path) -> None:
     assert planned["附录D 妊娠禁用药"].extractor == "PregnancyRuleExtractor"
     # 目录被跳过
     assert all(s.title != "目录" for s in plan.planned_sections)
-    # 目录（IRRELEVANT）+ 无规则措辞的正文（REFERENCE_ONLY）均被跳过
-    assert len(skipped) == 2
-    assert "IRRELEVANT" in (skipped[1].skip_reason or "")
+    # 止血后仅目录（IRRELEVANT）被跳过；无规则措辞的正文不再判 REFERENCE_ONLY，
+    # 改判 NARRATIVE_RULE 抽取，故 skipped 从 2 降为 1。
+    assert len(skipped) == 1
+    assert "IRRELEVANT" in (skipped[0].skip_reason or "")
     # 每个计划章节都有 prompt_version（模板 hash）
     for sec in plan.planned_sections:
         assert len(sec.prompt_version) == 12

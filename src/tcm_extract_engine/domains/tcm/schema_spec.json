@@ -1,0 +1,247 @@
+{
+  "schema_version": 2,
+  "record_types": {
+    "GENERAL_RULE": {
+      "payload": "TCMPayload",
+      "description": "叙述性规则：subject_text/action/attributes"
+    },
+    "HERB_TABLE": {
+      "payload": "TCMPayload",
+      "description": "中药表格条目：herb_name/dose/toxicity_level 列"
+    },
+    "TABLE_ROW": {
+      "payload": "TablePayload",
+      "description": "表格直通：原表逐行透传，不经 LLM"
+    },
+    "INTERACTION": {
+      "payload": "TCMPayload",
+      "description": "配伍禁忌关系组（十八反/十九畏），禁止 chunk 切断"
+    },
+    "PREGNANCY": {
+      "payload": "TCMPayload",
+      "description": "妊娠期用药规则"
+    },
+    "DOSAGE": {
+      "payload": "TCMPayload",
+      "description": "剂量规范（区间/单位/频次）"
+    },
+    "USAGE": {
+      "payload": "TCMPayload",
+      "description": "特殊用法（先煎/后下/包煎）"
+    },
+    "POPULATION": {
+      "payload": "TCMPayload",
+      "description": "特殊人群规则（儿童/老年/肝肾功能等）"
+    },
+    "HERB_FACTS": {
+      "payload": "TCMPayload",
+      "description": "药物专论事实（性味归经/功效/药理）"
+    },
+    "FIGURE": {
+      "payload": "TCMPayload",
+      "description": "图片/图表多模态视觉抽取"
+    }
+  },
+  "payload_models": {
+    "HerbDose": {
+      "fields": [
+        "min_dose",
+        "max_dose",
+        "unit",
+        "per_use",
+        "frequency",
+        "special_note"
+      ]
+    },
+    "InteractionMember": {
+      "fields": [
+        "herb_name",
+        "processed_form",
+        "role"
+      ]
+    },
+    "InteractionGroup": {
+      "fields": [
+        "group_name",
+        "interaction_type",
+        "anchor",
+        "members",
+        "direction"
+      ]
+    },
+    "PregnancyRule": {
+      "fields": [
+        "restriction_level",
+        "target_herbs",
+        "target_formulas",
+        "reason"
+      ]
+    },
+    "PopulationRule": {
+      "fields": [
+        "population",
+        "restriction_level",
+        "target_herbs",
+        "condition_text"
+      ]
+    },
+    "HerbFacts": {
+      "fields": [
+        "herb_name",
+        "nature",
+        "flavors",
+        "channels",
+        "efficacy",
+        "pharmacology",
+        "toxicity",
+        "clinical_notes",
+        "formulas",
+        "variants"
+      ]
+    },
+    "HerbFactVariant": {
+      "fields": [
+        "variant_name",
+        "nature_flavor",
+        "channels",
+        "efficacy",
+        "pharmacology",
+        "toxicity",
+        "notes"
+      ]
+    },
+    "TCMPayload": {
+      "fields": [
+        "herb_name",
+        "toxicity_level",
+        "dose",
+        "interaction",
+        "pregnancy",
+        "population",
+        "herb_facts",
+        "image_ref",
+        "action",
+        "attributes"
+      ]
+    }
+  },
+  "action_levels": {
+    "PROHIBIT": "禁用/不得/严禁",
+    "AVOID": "忌用/不宜",
+    "CAUTION": "慎用",
+    "MONITOR": "需监测/需医师确认",
+    "INFO": "提示性信息"
+  },
+  "action_keywords": {
+    "禁用": "PROHIBIT",
+    "禁止": "PROHIBIT",
+    "不得": "PROHIBIT",
+    "严禁": "PROHIBIT",
+    "忌用": "AVOID",
+    "不宜": "AVOID",
+    "不相": "AVOID",
+    "慎用": "CAUTION",
+    "谨慎": "CAUTION"
+  },
+  "restriction_levels": {
+    "禁用": "PROHIBIT",
+    "禁止": "PROHIBIT",
+    "忌用": "AVOID",
+    "不宜": "AVOID",
+    "慎用": "CAUTION",
+    "谨慎": "CAUTION",
+    "需监测": "MONITOR"
+  },
+  "toxicity_levels": [
+    "大毒",
+    "有毒",
+    "小毒",
+    "无毒"
+  ],
+  "verdicts": {
+    "SUPPORTED": "原文证实",
+    "PARTIAL": "部分证实",
+    "UNSUPPORTED": "未获原文支持",
+    "MISSING": "核验缺失",
+    "WRONG_DOSE": "剂量有误",
+    "WRONG_RELATION": "关系有误",
+    "WRONG_NORMALIZATION": "名称规范化有误",
+    "OCR_UNCERTAIN": "OCR 存疑",
+    "PASSTHROUGH": "直通免核验（流水线级）",
+    "FIGURE_REVIEW": "图片记录转人工复核（文本 B 无法比对图像）"
+  },
+  "content_types": {
+    "NARRATIVE_RULE": {
+      "extractor": "GeneralRuleExtractor",
+      "description": "叙述性规则文本"
+    },
+    "STRUCTURED_TABLE": {
+      "extractor": "HerbTableExtractor",
+      "description": "结构化表格（附录A/B 等）"
+    },
+    "ENTITY_LIST": {
+      "extractor": "HerbTableExtractor",
+      "description": "实体清单"
+    },
+    "ENTITY_GROUP_LIST": {
+      "extractor": "PregnancyRuleExtractor",
+      "description": "分组实体清单（妊娠禁用）"
+    },
+    "RELATION_PAIR": {
+      "extractor": "InteractionExtractor",
+      "description": "两两关系"
+    },
+    "RELATION_GROUP": {
+      "extractor": "InteractionExtractor",
+      "description": "关系组（十八反/十九畏）"
+    },
+    "HERB_MONOGRAPH": {
+      "extractor": "HerbFactsExtractor",
+      "description": "药物专论"
+    },
+    "CASE_RECORD": {
+      "extractor": "HerbFactsExtractor",
+      "description": "医案"
+    },
+    "FORMULA_RECORD": {
+      "extractor": "GeneralRuleExtractor",
+      "description": "方剂"
+    },
+    "FIGURE": {
+      "extractor": "FigureExtractor",
+      "description": "图片/图表（多模态视觉抽取）"
+    },
+    "REFERENCE_ONLY": {
+      "extractor": "",
+      "description": "仅参考（不抽取）"
+    },
+    "IRRELEVANT": {
+      "extractor": "",
+      "description": "无关（不抽取）"
+    }
+  },
+  "document_types": {
+    "STANDARD": "规范/标准",
+    "HANDBOOK": "手册",
+    "MONOGRAPH": "专著",
+    "TEXTBOOK": "教材",
+    "CASE_COLLECTION": "医案集",
+    "UNKNOWN": "未知"
+  },
+  "extractor_templates": {
+    "GeneralRuleExtractor": "general_rule.md",
+    "HerbTableExtractor": "herb_table.md",
+    "InteractionExtractor": "interaction_group.md",
+    "PregnancyRuleExtractor": "pregnancy_list.md",
+    "HerbFactsExtractor": "herb_facts.md",
+    "FigureExtractor": "figure.md"
+  },
+  "chunk_strategies": {
+    "GeneralRuleExtractor": "split",
+    "HerbTableExtractor": "split",
+    "InteractionExtractor": "whole_section",
+    "PregnancyRuleExtractor": "split",
+    "HerbFactsExtractor": "split",
+    "FigureExtractor": "split"
+  }
+}

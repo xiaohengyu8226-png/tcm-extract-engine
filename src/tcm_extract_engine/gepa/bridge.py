@@ -28,6 +28,7 @@ from typing import Any
 from tcm_extract_engine.cab.extractors import extract_records
 from tcm_extract_engine.cab.planner import (
     CHUNK_PLACEHOLDER,
+    BookAdaptedRegistry,
     PromptTemplate,
     PromptTemplateRegistry,
     SectionPlan,
@@ -38,6 +39,7 @@ from tcm_extract_engine.cab.verifier import VerificationReport, verify_records
 from tcm_extract_engine.core.artifacts import load_artifact
 from tcm_extract_engine.core.llm import UnifiedLLMClient
 from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.domains import get_domain_pack
 from tcm_extract_engine.gepa.engine import (
     EvaluateFn,
     FitnessResult,
@@ -69,19 +71,21 @@ class ConstrainedTemplateRegistry(PromptTemplateRegistry):
         constraint_block: str = "",
         *,
         prompts_root: Path | None = None,
+        base_registry: PromptTemplateRegistry | None = None,
     ) -> None:
         super().__init__(prompts_root)
+        self.base_registry = base_registry or PromptTemplateRegistry(prompts_root)
         self.target_template = target_template
         self.constraint_block = constraint_block.strip()
 
     def load(self, role: str, name: str) -> PromptTemplate:
         if role != "a" or name != self.target_template or not self.constraint_block:
-            return super().load(role, name)
+            return self.base_registry.load(role, name)
         key = f"{role}/{name}|+constraint({hash(self.constraint_block) & 0xFFFF:04x})"
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        base = super().load(role, name)
+        base = self.base_registry.load(role, name)
         content = f"{base.content.rstrip()}\n\n{self.constraint_block}\n"
         template = PromptTemplate(name=base.name, path=base.path, content=content)
         self._cache[key] = template
@@ -90,41 +94,29 @@ class ConstrainedTemplateRegistry(PromptTemplateRegistry):
 
 # ── verdict / validation → GEPA issues ──────────────────────────────────────
 
-# B 核验 verdict → (issue_type, severity, confidence)
-# 仅对 _REVIEW_VERDICTS 发问题；SUPPORTED / PARTIAL 不计入（PARTIAL 多为兜底，噪声大）
-_VERDICT_ISSUE_MAP: dict[str, tuple[str, str, float]] = {
-    "UNSUPPORTED": ("unsupported", "high", 0.9),
-    "MISSING": ("missing", "medium", 0.85),
-    "WRONG_DOSE": ("dosage_unit", "critical", 0.9),
-    "WRONG_RELATION": ("misclassified", "critical", 0.9),
-    "WRONG_NORMALIZATION": ("misclassified", "high", 0.85),
-    "OCR_UNCERTAIN": ("typo_or_ocr", "low", 0.6),
-}
+# 信号映射（verdict/category → issue 三元组）由领域包声明（domains/tcm/gepa_map.py），
+# 经 get_domain_pack() 读取；SUPPORTED / PARTIAL 不在映射内即不计入（PARTIAL 多为兜底，噪声大）。
 
-# 确定性校验 category → (issue_type, severity, confidence)
-_CATEGORY_ISSUE_MAP: dict[str, tuple[str, str, float]] = {
-    "SOURCE": ("unsupported", "high", 0.95),      # 无原文支撑 = 幻觉嫌疑
-    "SCHEMA": ("misclassified", "medium", 0.9),
-    "NUMERIC": ("dosage_unit", "high", 0.9),
-    "ENTITY": ("missing", "medium", 0.85),        # 关系组成员/妊娠目标缺失
-    "SEMANTIC": ("inconsistent", "high", 0.9),    # 措辞强度被违规升级
-    "COVERAGE": ("missing", "medium", 0.8),
-}
-
-# validate 只对 ERROR 计问题（WARNING 放行不罚）
+# validate 的 ERROR 与 WARNING 都计问题，但 WARNING 弱化：严重度降一级、
+# confidence 打折（仍高于 compute_fitness 的 min_confidence floor，故不被过滤掉）。
 _SEVERITY_CATEGORY_CONFIDENCE_FLOOR = 0.5
+_SEVERITY_DOWNGRADE = {"critical": "high", "high": "medium", "medium": "low", "low": "low"}
+_WARNING_CONFIDENCE_FACTOR = 0.65
 
 
 def verdict_to_issues(
     records_in_scope: Sequence[SourceRecord],
     verification: VerificationReport,
     validation: ValidationReport,
+    *,
+    pack: Any = None,
 ) -> list[dict[str, Any]]:
     """把 B 核验 + 确定性校验映射为 GEPA compute_fitness 的 issue 列表。
 
     json_pointer 采用 /records/{index} 形式，index = 记录在 records_in_scope 中的
     位置；compute_fitness 用它去重统计「受影响候选数」。
     """
+    pack = pack or get_domain_pack(records_in_scope[0].domain_id if records_in_scope else "tcm")
     index_by_id = {r.record_id: i for i, r in enumerate(records_in_scope)}
     in_scope_ids = set(index_by_id)
     issues: list[dict[str, Any]] = []
@@ -134,43 +126,56 @@ def verdict_to_issues(
         idx = index_by_id.get(result.record_id)
         if idx is None:
             continue
-        mapped = _VERDICT_ISSUE_MAP.get(result.verdict.value)
+        mapped = pack.verdict_issue_map.get(result.verdict.value)
         if mapped is None:
             continue
         issue_type, severity, confidence = mapped
-        issues.append({
-            "issue_type": issue_type,
-            "severity": severity,
-            "confidence": confidence,
-            "json_pointer": f"/records/{idx}",
-            "message": result.explanation or result.verdict.value,
-        })
+        issues.append(
+            {
+                "issue_type": issue_type,
+                "severity": severity,
+                "confidence": confidence,
+                "json_pointer": f"/records/{idx}",
+                "message": result.explanation or result.verdict.value,
+            }
+        )
 
-    # 2) 确定性校验 ERROR（去重：同记录同类别只记一次，避免与 B 双重惩罚膨胀）
+    # 2) 确定性校验 ERROR + WARNING（WARNING 降一级严重度、confidence 打折，
+    #    信号弱于 ERROR 但不再被完全忽略；同记录同类别去重，ERROR 优先保留）
     seen: set[tuple[int, str]] = set()
-    for vi in validation.issues:
-        if vi.severity.value != "ERROR":
+    ordered = sorted(
+        validation.issues,
+        key=lambda vi: 0 if vi.severity.value == "ERROR" else 1,
+    )
+    for vi in ordered:
+        sev_name = vi.severity.value
+        if sev_name not in ("ERROR", "WARNING"):
             continue
         idx = index_by_id.get(vi.record_id)
         if idx is None:
             continue
-        mapped = _CATEGORY_ISSUE_MAP.get(vi.category.value)
+        mapped = pack.category_issue_map.get(vi.category.value)
         if mapped is None:
             continue
         issue_type, severity, confidence = mapped
+        if sev_name == "WARNING":
+            severity = _SEVERITY_DOWNGRADE.get(severity, "low")
+            confidence = round(confidence * _WARNING_CONFIDENCE_FACTOR, 3)
         if confidence < _SEVERITY_CATEGORY_CONFIDENCE_FLOOR:
             continue
         dedup = (idx, issue_type)
         if dedup in seen:
             continue
         seen.add(dedup)
-        issues.append({
-            "issue_type": issue_type,
-            "severity": severity,
-            "confidence": confidence,
-            "json_pointer": f"/records/{idx}",
-            "message": vi.message,
-        })
+        issues.append(
+            {
+                "issue_type": issue_type,
+                "severity": severity,
+                "confidence": confidence,
+                "json_pointer": f"/records/{idx}",
+                "message": vi.message,
+            }
+        )
 
     _ = in_scope_ids  # 保留：未来按范围裁剪 verification 冗余结果时使用
     return issues
@@ -197,11 +202,16 @@ def build_feedback_text(
 
     # B 核验失败项（优先严重 verdict）
     severity_order = {
-        "UNSUPPORTED": 0, "WRONG_DOSE": 0, "WRONG_RELATION": 0,
-        "WRONG_NORMALIZATION": 1, "MISSING": 1, "OCR_UNCERTAIN": 2,
+        "UNSUPPORTED": 0,
+        "WRONG_DOSE": 0,
+        "WRONG_RELATION": 0,
+        "WRONG_NORMALIZATION": 1,
+        "MISSING": 1,
+        "OCR_UNCERTAIN": 2,
     }
     failing = [
-        r for r in verification.results
+        r
+        for r in verification.results
         if r.record_id in record_by_id and r.verdict.value in severity_order
     ]
     failing.sort(key=lambda r: severity_order.get(r.verdict.value, 9))
@@ -214,7 +224,7 @@ def build_feedback_text(
 
     for r in failing[:max_items]:
         rec = record_by_id.get(r.record_id)
-        snippet = (rec.raw_text[:120] if rec else "")
+        snippet = rec.raw_text[:120] if rec else ""
         lines.append(
             f"- [{r.verdict.value}] {r.record_id}"
             + (f"：{r.explanation}" if r.explanation else "")
@@ -233,6 +243,16 @@ def build_feedback_text(
         lines.append("确定性校验 ERROR：")
         lines.extend(error_lines[:max_items])
 
+    # 确定性校验 WARNING 汇总（弱信号，排在 ERROR 之后，单独限量）
+    warning_lines = [
+        f"- [VALIDATE-WARN/{vi.category.value}] {vi.record_id}: {vi.message}"
+        for vi in validation.issues
+        if vi.severity.value == "WARNING"
+    ]
+    if warning_lines:
+        lines.append("确定性校验 WARNING（弱信号，供参考）：")
+        lines.extend(warning_lines[:max_items])
+
     if not lines:
         return "本批次未发现核验/校验问题（可能全部 SUPPORTED，或范围为空）。"
     return "\n".join(lines)
@@ -250,9 +270,12 @@ class EvalOutcome:
     per_instance_scores: dict[str, float] = field(default_factory=dict)
     total_records: int = 0
     records_in_scope: int = 0
+    evaluated_records: int = 0
+    unassessed_records: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     llm_calls: int = 0
+    quality_metrics: dict[str, Any] = field(default_factory=dict)
     issues: list[dict[str, Any]] = field(default_factory=list)
     """映射后的 GEPA issue 列表（跨书聚合时用于精确重算适应度）。"""
 
@@ -275,17 +298,7 @@ def _scope_records(
     依据 plan 中 template==target_template 的章节 block_ids，与记录 source.block_ids
     求交集；无法归属（无 block_ids）时回退为全部记录，保证 P0 冒烟不被空范围卡死。
     """
-    target_block_ids: set[str] = set()
-    for sec in sections:
-        if sec.template == target_template and not sec.skip_reason:
-            target_block_ids.update(str(b) for b in sec.block_ids)
-    if not target_block_ids:
-        return list(records)
-    scoped = [
-        r for r in records
-        if set(str(b) for b in r.source.block_ids) & target_block_ids
-    ]
-    return scoped or list(records)
+    return [r for r in records if not r.passthrough and r.generation.template == target_template]
 
 
 async def evaluate_candidate(
@@ -300,6 +313,9 @@ async def evaluate_candidate(
     work_dir: Path,
     registry: PromptTemplateRegistry | None = None,
     verify_sample: int | None = None,
+    pack: Any = None,
+    vision_client: UnifiedLLMClient | None = None,
+    vision_verify_client: UnifiedLLMClient | None = None,
 ) -> EvalOutcome:
     """对「一本书 × 一个 A 模板 × 一段候选约束块」跑真实评估。
 
@@ -315,9 +331,17 @@ async def evaluate_candidate(
     Returns:
         EvalOutcome（fitness + feedback + 每实例分 + token 用量）。
     """
+    clients = list({id(c): c for c in [extract_client, verify_client, vision_client, vision_verify_client] if c is not None}.values())
+    before_usage = {id(c): (c.usage.input_tokens, c.usage.output_tokens, c.usage.calls) for c in clients}
+    plan_meta = load_artifact(plan_path)
+    pack = pack or get_domain_pack(plan_meta.get("domain_id", "tcm"))
+    if registry is None:
+        registry = BookAdaptedRegistry(plan_meta.get("book_adaptations", {}))
     constrained = ConstrainedTemplateRegistry(
-        target_template, constraint_block,
-        prompts_root=(registry.prompts_root if registry is not None else None),
+        target_template,
+        constraint_block,
+        prompts_root=registry.prompts_root,
+        base_registry=registry,
     )
     cache_dir = work_dir / "extract_cache"
     verify_cache_dir = work_dir / "verify_cache"
@@ -330,6 +354,8 @@ async def evaluate_candidate(
         cache_dir=cache_dir,
         client=extract_client,
         registry=constrained,
+        pack=pack,
+        vision_client=vision_client,
     )
 
     sections = _plan_sections(plan_path)
@@ -337,21 +363,36 @@ async def evaluate_candidate(
 
     # 2) 确定性校验（廉价预筛；对范围内记录）
     blocks = load_blocks(blocks_path)
-    validation = validate_records(list(scoped), blocks=blocks)
+    validation = validate_records(list(scoped), blocks=blocks, pack=pack)
 
     # 3) B 核验（可采样以控成本）
-    verify_targets = scoped if verify_sample is None else scoped[:verify_sample]
+    if verify_sample is not None and verify_sample < 1:
+        raise ValueError("verify_sample 必须大于 0 或为 None")
+    # Deterministic, section-stratified sample; a long first chapter cannot consume it all.
+    ordered = sorted(scoped, key=lambda r: (r.source.section_path, r.record_id))
+    groups: dict[tuple[str, ...], list[SourceRecord]] = {}
+    for record in ordered:
+        groups.setdefault(tuple(record.source.section_path), []).append(record)
+    verify_targets: list[SourceRecord] = []
+    limit = len(scoped) if verify_sample is None else min(verify_sample, len(scoped))
+    while len(verify_targets) < limit:
+        for group in groups.values():
+            if group and len(verify_targets) < limit:
+                verify_targets.append(group.pop(0))
     verification = await verify_records(
         records=list(verify_targets),
         blocks_path=blocks_path,
         client=verify_client,
         registry=constrained,
         cache_dir=verify_cache_dir,
+        pack=pack,
+        vision_client=vision_verify_client or vision_client,
     )
 
     # 4) 映射 → 适应度
-    issues = verdict_to_issues(scoped, verification, validation)
-    fitness = compute_fitness(total_candidates=len(scoped), issues=issues)
+    issues = verdict_to_issues(verify_targets, verification, validation, pack=pack)
+    # Unassessed records are never counted as passed.
+    fitness = compute_fitness(total_candidates=len(verify_targets), issues=issues)
     feedback = build_feedback_text(scoped, verification, validation)
 
     outcome = EvalOutcome(
@@ -360,16 +401,33 @@ async def evaluate_candidate(
         per_instance_scores={book_id: fitness.fitness},
         total_records=len(records),
         records_in_scope=len(scoped),
-        input_tokens=extract_client.usage.input_tokens + verify_client.usage.input_tokens,
-        output_tokens=extract_client.usage.output_tokens + verify_client.usage.output_tokens,
-        llm_calls=extract_client.usage.calls + verify_client.usage.calls,
+        evaluated_records=len(verify_targets),
+        unassessed_records=len(scoped) - len(verify_targets),
+        input_tokens=sum(c.usage.input_tokens-before_usage[id(c)][0] for c in clients),
+        output_tokens=sum(c.usage.output_tokens-before_usage[id(c)][1] for c in clients),
+        llm_calls=sum(c.usage.calls-before_usage[id(c)][2] for c in clients),
         issues=issues,
+        quality_metrics={"assessed_records": len(verify_targets), "unassessed_records": len(scoped)-len(verify_targets),
+                         "schema_errors": sum(i.severity.value == "ERROR" for i in validation.issues),
+                         "located_records": sum(bool(r.source.block_ids) for r in scoped),
+                         "reference_recall": None, "gold_status": "pending_human_confirmation",
+                         "assessment": "model-assisted proxy; not gold accuracy"},
     )
+    from tcm_extract_engine.core.artifacts import _atomic_write_json
+    _atomic_write_json(work_dir / "evaluation.json", {
+        "book_id": book_id, "template": target_template, "domain_id": pack.id,
+        "fitness": fitness.fitness, "quality_metrics": outcome.quality_metrics,
+        "issues": issues, "feedback": feedback, "record_ids": [r.record_id for r in scoped],
+    })
     logger.info(
-        "[GEPABridge] 评估 book=%s template=%s: fitness=%.4f 范围记录=%d/%d "
-        "issues=%d calls=%d",
-        book_id, target_template, fitness.fitness, len(scoped), len(records),
-        len(issues), outcome.llm_calls,
+        "[GEPABridge] 评估 book=%s template=%s: fitness=%.4f 范围记录=%d/%d issues=%d calls=%d",
+        book_id,
+        target_template,
+        fitness.fitness,
+        len(scoped),
+        len(records),
+        len(issues),
+        outcome.llm_calls,
     )
     return outcome
 
@@ -402,6 +460,9 @@ def make_evaluate_fn(
     work_dir_root: Path,
     registry: PromptTemplateRegistry | None = None,
     verify_sample: int | None = None,
+    pack: Any = None,
+    vision_client: UnifiedLLMClient | None = None,
+    vision_verify_client: UnifiedLLMClient | None = None,
 ) -> EvaluateFn:
     """构造 GEPAEngine 的 evaluate_fn 注入：把「个体」映射为真实评估。
 
@@ -426,6 +487,9 @@ def make_evaluate_fn(
             work_dir=work_dir,
             registry=registry,
             verify_sample=verify_sample,
+            pack=pack,
+            vision_client=vision_client,
+            vision_verify_client=vision_verify_client,
         )
         return fold_outcome_to_fitness(outcome)
 
@@ -506,13 +570,10 @@ def make_reflective_proposer(
     根因并产出「新的追加约束块」。失败或无新意时回退内置静态 mutate_prompt，
     保证进化不因单次反思失败而停滞。
     """
-    async def propose(
-        parent: PromptIndividual, parent_fitness: FitnessResult
-    ) -> PromptIndividual:
+
+    async def propose(parent: PromptIndividual, parent_fitness: FitnessResult) -> PromptIndividual:
         parent_block = parent.extraction_prompt.strip()
-        user_prompt = _build_reflection_prompt(
-            parent_block, parent_fitness, target_template
-        )
+        user_prompt = _build_reflection_prompt(parent_block, parent_fitness, target_template)
         try:
             resp = await llm_client.complete_json(
                 system_prompt=_REFLECTION_SYSTEM_PROMPT,
@@ -520,9 +581,7 @@ def make_reflective_proposer(
                 temperature=temperature,
             )
         except Exception:  # noqa: BLE001 - 反思失败不应中断进化
-            logger.warning(
-                "[GEPABridge] 反思调用失败，回退静态变异 parent=%s", parent.prompt_id
-            )
+            logger.warning("[GEPABridge] 反思调用失败，回退静态变异 parent=%s", parent.prompt_id)
             return mutate_prompt(parent, parent_fitness, 1.0)
 
         block = _sanitize_constraint_block(
@@ -531,9 +590,7 @@ def make_reflective_proposer(
         rationale = str(resp.get("rationale", "")).strip()
         if not block or block == parent_block:
             # 反思无产出/无新意 → 回退静态变异，维持种群探索
-            logger.info(
-                "[GEPABridge] 反思无新约束，回退静态变异 parent=%s", parent.prompt_id
-            )
+            logger.info("[GEPABridge] 反思无新约束，回退静态变异 parent=%s", parent.prompt_id)
             return mutate_prompt(parent, parent_fitness, 1.0)
 
         return PromptIndividual(
@@ -646,4 +703,3 @@ def make_system_aware_merger(
         )
 
     return merge
-

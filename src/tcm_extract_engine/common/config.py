@@ -69,9 +69,24 @@ class Settings:
     verify_thinking_enabled: bool = True  # 校验默认开启思考模式
     verify_concurrency: int = 8  # 校验批次并发数
 
+    # ── 视觉模型（多模态图片理解） ──
+    vision_model: str = ""  # 空 = 使用 extract_model（需支持 vision）
+    vision_base_url: str = ""  # 空 = 使用 extract_base_url
+    vision_api_key: str = ""  # 空 = 使用 extract_api_key
+    vision_timeout: int = 0  # 0 = 使用 llm_timeout
+    vision_max_tokens: int = 0  # 0 = 使用 llm_max_tokens
+    vision_thinking_enabled: bool = False  # 视觉模型通常不需要思考模式
+    vision_concurrency: int = 2  # 独立于云端文本并发，限制本地视觉服务排队
+    vision_max_image_size: int = 1024  # 图片压缩最大边长（像素）
+    vision_enabled: bool = True  # 是否启用多模态视觉抽取
+
     # Pipeline
     llm_batch_size: int = 5  # 每次 LLM 调用包含的 chunk 数
     parse_retries: int = 2
+    plan_adaptation_enabled: bool = True  # plan 阶段是否用 C-LLM 生成每书适配块
+    plan_goal_enabled: bool = True  # plan 阶段是否用 C-LLM 归纳每书 goal（关闭则回退领域包默认）
+    structure_repair_enabled: bool = True  # parse 阶段是否用 C-LLM 修复标题层级（大纲修复）
+    structure_bookmarks_enabled: bool = True  # 大纲修复前是否先用 PDF 内嵌书签确定性定级
 
     # MinerU
     mineru_max_concurrent_parse: int = 1  # 进程内 Pipeline backend 默认串行，保护 GPU/显存
@@ -112,6 +127,22 @@ class Settings:
             timeout=self.verify_timeout or self.llm_timeout,
             max_tokens=self.verify_max_tokens or self.llm_max_tokens,
             thinking_enabled=self.verify_thinking_enabled,
+        )
+
+    @property
+    def vision_llm(self) -> ModelConfig:
+        """视觉模型配置（多模态图片理解）。
+
+        回退链：vision_* → vllm_*（本地 vLLM 端点，见 from_env）→ extract_* → openai_*
+        注意：vision model 必须支持图片输入（如 Qwen-VL / GPT-4V）。
+        """
+        return ModelConfig(
+            base_url=self.vision_base_url or self.extract_base_url or self.openai_base_url,
+            api_key=self.vision_api_key or self.extract_api_key or self.openai_api_key,
+            model=self.vision_model or self.extract_model or self.openai_model,
+            timeout=self.vision_timeout or self.llm_timeout,
+            max_tokens=self.vision_max_tokens or self.llm_max_tokens,
+            thinking_enabled=self.vision_thinking_enabled,
         )
 
     @classmethod
@@ -156,9 +187,34 @@ class Settings:
             verify_max_tokens=_int("VERIFY_MAX_TOKENS", 0),
             verify_thinking_enabled=_bool("VERIFY_THINKING_ENABLED", True),
             verify_concurrency=_int("VERIFY_CONCURRENCY", defaults.verify_concurrency),
+            # 视觉模型（多模态）：VISION_* 未显式设置时回退到本地 vLLM 端点（VLLM_*），
+            # 复用已部署的视觉模型（qwen3.8-27b-fp8）；再回退 extract_* → openai_*（见 vision_llm）
+            vision_model=os.getenv("VISION_MODEL") or os.getenv("VLLM_MODEL", ""),
+            vision_base_url=os.getenv("VISION_BASE_URL") or os.getenv("VLLM_BASE_URL", ""),
+            vision_api_key=os.getenv("VISION_API_KEY") or os.getenv("VLLM_API_KEY", ""),
+            vision_timeout=_int("VISION_TIMEOUT", 0) or int(os.getenv("VLLM_TIMEOUT", "0") or 0),
+            vision_max_tokens=_int("VISION_MAX_TOKENS", 0),
+            vision_thinking_enabled=_bool("VISION_THINKING_ENABLED", False),
+            vision_concurrency=_int(
+                "VISION_CONCURRENCY", _int("VLLM_MAX_CONCURRENCY", defaults.vision_concurrency)
+            ),
+            vision_max_image_size=_int("VISION_MAX_IMAGE_SIZE", defaults.vision_max_image_size),
+            vision_enabled=_bool("VISION_ENABLED", defaults.vision_enabled),
             # Pipeline
             llm_batch_size=_int("LLM_BATCH_SIZE", defaults.llm_batch_size),
             parse_retries=_int("PARSE_RETRIES", defaults.parse_retries),
+            plan_adaptation_enabled=_bool(
+                "PLAN_ADAPTATION_ENABLED", defaults.plan_adaptation_enabled
+            ),
+            plan_goal_enabled=_bool(
+                "PLAN_GOAL_ENABLED", defaults.plan_goal_enabled
+            ),
+            structure_repair_enabled=_bool(
+                "STRUCTURE_REPAIR_ENABLED", defaults.structure_repair_enabled
+            ),
+            structure_bookmarks_enabled=_bool(
+                "STRUCTURE_BOOKMARKS_ENABLED", defaults.structure_bookmarks_enabled
+            ),
             mineru_max_concurrent_parse=_int(
                 "MINERU_MAX_CONCURRENT_PARSE", defaults.mineru_max_concurrent_parse
             ),

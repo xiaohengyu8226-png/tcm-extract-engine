@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "record_types": {
+    "KNOWLEDGE": {
+      "payload": "KnowledgeFact"
+    },
+    "TABLE_ROW": {
+      "payload": "TablePayload"
+    },
+    "FIGURE": {
+      "payload": "FigurePayload"
+    }
+  },
+  "content_types": {
+    "KNOWLEDGE": {
+      "extractor": "KnowledgeExtractor"
+    },
+    "IRRELEVANT": {
+      "extractor": ""
+    }
+  },
+  "extractor_templates": {
+    "KnowledgeExtractor": "knowledge.md",
+    "FigureExtractor": "figure_general.md",
+    "TableKnowledgeExtractor": "knowledge_table.md"
+  },
+  "chunk_strategies": {
+    "KnowledgeExtractor": "split",
+    "FigureExtractor": "split",
+    "TableKnowledgeExtractor": "split"
+  }
+}

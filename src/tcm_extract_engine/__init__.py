@@ -32,7 +32,7 @@ from tcm_extract_engine.core.artifacts import (
 )
 from tcm_extract_engine.core.book import BookWorkspace
 from tcm_extract_engine.core.manifest import BookManifest, BookStatus, StageRecord
-from tcm_extract_engine.core.records import RecordType, SafetyRule, SourceRecord
+from tcm_extract_engine.core.records import SafetyRule, SourceRecord
 from tcm_extract_engine.runner import BookPipeline
 
 __all__ = [
@@ -43,7 +43,6 @@ __all__ = [
     "BookWorkspace",
     "CorrectionEntry",
     "IssueCategory",
-    "RecordType",
     "SafetyRule",
     "Severity",
     "SourceRecord",

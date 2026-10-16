@@ -20,14 +20,14 @@ from tcm_extract_engine.core.manifest import (
     BookStatus,
     StageRecord,
 )
-from tcm_extract_engine.core.records import (
+from tcm_extract_engine.domains.tcm.schema import (
     ActionLevel,
     InteractionGroup,
     InteractionMember,
     RecordType,
-    SourceRecord,
     action_exceeds_ceiling,
 )
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 
 # ── manifest / 状态机 ─────────────────────────────────────────────────────────
 
@@ -162,7 +162,7 @@ def test_source_record_minimal() -> None:
 
 
 def test_source_record_dose_validation() -> None:
-    from tcm_extract_engine.core.records import HerbDose
+    from tcm_extract_engine.domains.tcm.schema import HerbDose
 
     rec = SourceRecord(
         record_id="SR-abc123de-000002",
@@ -254,8 +254,15 @@ def test_workspace_create_idempotent(tmp_path: Path) -> None:
 
     # 阶段目录全部就位
     for stage_dir in (
-        "00_source", "01_parse", "02_profile", "03_plan",
-        "04_extract", "05_validate", "06_verify", "07_review", "08_publish",
+        "00_source",
+        "01_parse",
+        "02_profile",
+        "03_plan",
+        "04_extract",
+        "05_validate",
+        "06_verify",
+        "07_review",
+        "08_publish",
     ):
         assert (ws1.book_dir / stage_dir).is_dir(), f"缺少目录 {stage_dir}"
 

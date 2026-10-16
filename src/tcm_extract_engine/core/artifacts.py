@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
@@ -47,7 +48,7 @@ def save_artifact(
     *,
     header: ArtifactHeader,
     data: BaseModel | dict[str, Any],
-    records: list[BaseModel] | None = None,
+    records: Sequence[BaseModel] | None = None,
 ) -> str:
     """保存带元数据信封的 Artifact，返回内容 hash。
 
@@ -121,7 +122,7 @@ def load_artifact_records(path: Path, model_cls: type[T]) -> list[T]:
 # ── 原子写入 ─────────────────────────────────────────────────────────────────
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_write_json(path: Path, payload: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -129,7 +130,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def _atomic_write_jsonl(path: Path, header: dict[str, Any], records: list[BaseModel]) -> None:
+def _atomic_write_jsonl(path: Path, header: dict[str, Any], records: Sequence[BaseModel]) -> None:
     """jsonl 首行为 header，其后每行一条记录。"""
     tmp = path.with_suffix(path.suffix + ".tmp")
     lines = [json.dumps({"header": header}, ensure_ascii=False)]

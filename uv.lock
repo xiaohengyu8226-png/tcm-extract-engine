@@ -6640,6 +6640,7 @@ name = "tcm-extract-engine"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "openai" },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -6670,6 +6671,7 @@ web = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", marker = "extra == 'web'", specifier = ">=0.110" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "mineru", extras = ["all"], marker = "extra == 'mineru'", specifier = "==3.4.4" },
     { name = "openai", specifier = ">=1.30" },

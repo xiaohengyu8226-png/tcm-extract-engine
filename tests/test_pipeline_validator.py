@@ -10,15 +10,15 @@ from tcm_extract_engine.cab.validator import (
     ValidationReport,
     validate_records,
 )
-from tcm_extract_engine.core.records import (
+from tcm_extract_engine.domains.tcm.schema import (
     ActionLevel,
     HerbDose,
     InteractionGroup,
     InteractionMember,
     PregnancyRule,
     RecordType,
-    SourceRecord,
 )
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 
 
 def make_record(**overrides: Any) -> SourceRecord:
@@ -66,8 +66,7 @@ def test_schema_herb_table_missing_name() -> None:
     report = validate_records([record])
     assert not report.passed
     assert any(
-        i.category == IssueCategory.SCHEMA and "herb_name" in i.message
-        for i in report.issues
+        i.category == IssueCategory.SCHEMA and "herb_name" in i.message for i in report.issues
     )
 
 
@@ -85,8 +84,7 @@ def test_numeric_min_greater_than_max() -> None:
     report = validate_records([record])
     assert not report.passed
     assert any(
-        i.category == IssueCategory.NUMERIC and "min_dose" in i.message
-        for i in report.issues
+        i.category == IssueCategory.NUMERIC and "min_dose" in i.message for i in report.issues
     )
 
 
@@ -118,8 +116,7 @@ def test_source_empty_raw_text() -> None:
     report = validate_records([record])
     assert not report.passed
     assert any(
-        i.category == IssueCategory.SOURCE and i.severity == Severity.ERROR
-        for i in report.issues
+        i.category == IssueCategory.SOURCE and i.severity == Severity.ERROR for i in report.issues
     )
 
 
@@ -150,10 +147,7 @@ def test_entity_interaction_missing_members() -> None:
     record = _interaction_record([])
     report = validate_records([record])
     assert not report.passed
-    assert any(
-        i.category == IssueCategory.ENTITY and "成员" in i.message
-        for i in report.issues
-    )
+    assert any(i.category == IssueCategory.ENTITY and "成员" in i.message for i in report.issues)
 
 
 def test_entity_interaction_duplicate_member_warning() -> None:
@@ -186,10 +180,7 @@ def test_semantic_action_upgrade_rejected() -> None:
     record = make_record(raw_text="孕妇慎用红花。", action=ActionLevel.PROHIBIT)
     report = validate_records([record])
     assert not report.passed
-    assert any(
-        i.category == IssueCategory.SEMANTIC and "上限" in i.message
-        for i in report.issues
-    )
+    assert any(i.category == IssueCategory.SEMANTIC and "上限" in i.message for i in report.issues)
 
 
 def test_semantic_action_at_ceiling_allowed() -> None:
@@ -238,8 +229,7 @@ def test_coverage_member_count_mismatch() -> None:
     report = validate_records([record])
     assert not report.passed
     assert any(
-        i.category == IssueCategory.COVERAGE and "member_count" in i.message
-        for i in report.issues
+        i.category == IssueCategory.COVERAGE and "member_count" in i.message for i in report.issues
     )
 
 
@@ -257,12 +247,16 @@ def test_coverage_member_count_match_passes() -> None:
 
 def test_coverage_duplicate_records() -> None:
     r1 = make_record(
-        record_id="SR-test0001-000001", record_type=RecordType.HERB_TABLE,
-        herb_name="制川乌", raw_text="制川乌 1.5～3g",
+        record_id="SR-test0001-000001",
+        record_type=RecordType.HERB_TABLE,
+        herb_name="制川乌",
+        raw_text="制川乌 1.5～3g",
     )
     r2 = make_record(
-        record_id="SR-test0001-000002", record_type=RecordType.HERB_TABLE,
-        herb_name="制川乌", raw_text="制川乌 1.5～3g（重复行）",
+        record_id="SR-test0001-000002",
+        record_type=RecordType.HERB_TABLE,
+        herb_name="制川乌",
+        raw_text="制川乌 1.5～3g（重复行）",
     )
     report = validate_records([r1, r2])
     assert report.passed  # WARNING 不阻断
@@ -274,13 +268,16 @@ def test_coverage_table_rows() -> None:
     """表格 3 数据行只抽出 1 条记录 → WARNING。"""
     blocks = [
         {
-            "type": "content", "blockid": "tb1", "format": "drawing",
+            "type": "content",
+            "blockid": "tb1",
+            "format": "drawing",
             "content": "<drawing id='tb-1'><table>"
-                       "<tr><td>药名</td></tr><tr><td>川乌</td></tr>"
-                       "<tr><td>草乌</td></tr><tr><td>附子</td></tr>"
-                       "</table></drawing>",
+            "<tr><td>药名</td></tr><tr><td>川乌</td></tr>"
+            "<tr><td>草乌</td></tr><tr><td>附子</td></tr>"
+            "</table></drawing>",
             "heading": "附录A 有毒中药",
-            "parent_headings": [], "level": 2,
+            "parent_headings": [],
+            "level": 2,
         },
     ]
     record = make_record(
@@ -292,8 +289,7 @@ def test_coverage_table_rows() -> None:
     report = validate_records([record], blocks=blocks)
     assert report.passed  # WARNING 不阻断
     assert any(
-        i.category == IssueCategory.COVERAGE and "表格覆盖率" in i.message
-        for i in report.issues
+        i.category == IssueCategory.COVERAGE and "表格覆盖率" in i.message for i in report.issues
     )
 
 
@@ -302,9 +298,7 @@ def test_coverage_table_rows() -> None:
 
 def test_report_counts_and_errors_for() -> None:
     good = make_record()
-    bad = make_record(
-        record_id="SR-test0001-000002", raw_text=""
-    )
+    bad = make_record(record_id="SR-test0001-000002", raw_text="")
     report = validate_records([good, bad])
     assert report.total_records == 2
     assert report.error_count == 1

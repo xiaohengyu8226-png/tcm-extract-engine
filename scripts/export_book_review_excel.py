@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import enum
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -27,8 +28,12 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.worksheet import Worksheet
 
+from tcm_extract_engine.cab.profiler import load_blocks
+from tcm_extract_engine.common.config import get_settings
 from tcm_extract_engine.core.artifacts import load_artifact_records
 from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.core.tables import drawing_id, parse_table
+from tcm_extract_engine.domains import get_domain_pack
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT / "workspace" / "books"
@@ -36,33 +41,13 @@ WORKSPACE = ROOT / "workspace" / "books"
 REVIEW_SHEET = "审核记录表"
 STATS_SHEET = "统计汇总"
 GUIDE_SHEET = "填写说明"
+RAW_TABLE_SHEET = "原始表格"
 
-TYPE_LABELS: dict[str, str] = {
-    "GENERAL_RULE": "一般规则",
-    "HERB_TABLE": "药物条目",
-    "INTERACTION": "配伍禁忌",
-    "PREGNANCY": "妊娠禁忌",
-    "DOSAGE": "剂量规范",
-    "USAGE": "特殊用法",
-    "POPULATION": "特殊人群",
-}
 
-ACTION_LABELS: dict[str, str] = {
-    "PROHIBIT": "禁用",
-    "AVOID": "忌用/不宜",
-    "CAUTION": "慎用",
-    "MONITOR": "需监测",
-    "INFO": "提示",
-}
+def _pack_labels(group: str, domain_id: str = "tcm") -> dict[str, str]:
+    """领域包标签表（record_type/action/verdict 等，见 manifest.labels）。"""
+    return get_domain_pack(domain_id).labels.get(group, {})
 
-VERDICT_LABELS: dict[str, str] = {
-    "SUPPORTED": "已证实",
-    "PARTIAL": "部分证实",
-    "UNSUPPORTED": "未获原文支持",
-    "WRONG_NORMALIZATION": "名称规范化有误",
-    "WRONG_RELATION": "关系抽取有误",
-    "MISSING": "核验缺失",
-}
 
 REVIEW_HEADERS = [
     "记录编号",
@@ -99,93 +84,16 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _dose_text(record: SourceRecord) -> str:
-    dose = record.dose
-    if dose is None:
-        return ""
-    parts: list[str] = []
-    if dose.min_dose is not None and dose.max_dose is not None:
-        parts.append(f"{dose.min_dose:g}~{dose.max_dose:g}{dose.unit}")
-    elif dose.max_dose is not None:
-        parts.append(f"≤{dose.max_dose:g}{dose.unit}")
-    elif dose.min_dose is not None:
-        parts.append(f"≥{dose.min_dose:g}{dose.unit}")
-    if dose.per_use:
-        parts.append("（单次剂量）")
-    if dose.frequency:
-        parts.append(f"频次：{dose.frequency}")
-    if dose.special_note:
-        parts.append(f"备注：{dose.special_note}")
-    return "；".join(parts)
-
-
 def _structured_content(record: SourceRecord) -> str:
-    """把类型化载荷压平成医生可读的一列文本。"""
-    parts: list[str] = []
-    if record.interaction is not None:
-        group = record.interaction
-        head = group.interaction_type
-        if group.group_name:
-            head += f"（{group.group_name}）"
-        anchor = group.anchor.herb_name + (f"（{group.anchor.processed_form}）" if group.anchor.processed_form else "")
-        members = "、".join(
-            m.herb_name + (f"（{m.processed_form}）" if m.processed_form else "") for m in group.members
-        )
-        relation = f"{anchor} 畏 {members}" if group.direction else f"{anchor} 反/畏 {members}"
-        parts.append(f"{head}：{relation}")
-    if record.pregnancy is not None:
-        rule = record.pregnancy
-        targets = "、".join([*rule.target_herbs, *rule.target_formulas])
-        seg = f"限制级别：{rule.restriction_level}"
-        if targets:
-            seg += f"；对象：{targets}"
-        if rule.reason:
-            seg += f"；原因：{rule.reason}"
-        parts.append(seg)
-    if record.population is not None:
-        rule = record.population
-        seg = f"人群：{rule.population}；限制：{rule.restriction_level}"
-        if rule.target_herbs:
-            seg += f"；药物：{'、'.join(rule.target_herbs)}"
-        if rule.condition_text:
-            seg += f"；条件：{rule.condition_text}"
-        parts.append(seg)
-    dose = _dose_text(record)
-    if dose:
-        parts.append(dose)
-    if record.toxicity_level:
-        parts.append(f"毒性：{record.toxicity_level}")
-    if record.record_type == "USAGE" and record.attributes.get("usage_note"):
-        parts.append(_text(record.attributes["usage_note"]))
-    elif record.attributes:
-        extras = {k: v for k, v in record.attributes.items() if k != "usage_note"}
-        if extras:
-            note = "；".join(f"{k}={_text(v)}" for k, v in extras.items() if _text(v))
-            if note:
-                parts.append(note[:300])
-    return "；".join(parts)
+    return get_domain_pack(record.domain_id).flatten_for_review(record)
 
 
 def _subject(record: SourceRecord) -> str:
-    if record.herb_name:
-        return record.herb_name
-    if record.interaction is not None:
-        return record.interaction.anchor.herb_name
-    if record.pregnancy is not None:
-        return "、".join([*record.pregnancy.target_herbs, *record.pregnancy.target_formulas])
-    if record.population is not None:
-        return record.population.population
-    return _text(record.subject_text)
+    return get_domain_pack(record.domain_id).subject_of(record)
 
 
 def _related_herbs(record: SourceRecord) -> str:
-    if record.interaction is not None:
-        return "、".join(m.herb_name for m in record.interaction.members)
-    if record.pregnancy is not None:
-        return "、".join(record.pregnancy.target_herbs)
-    if record.population is not None:
-        return "、".join(record.population.target_herbs)
-    return ""
+    return get_domain_pack(record.domain_id).related_subjects(record)
 
 
 def _correction_diff(record: SourceRecord, corrected: dict[str, Any]) -> str:
@@ -205,8 +113,95 @@ def _correction_diff(record: SourceRecord, corrected: dict[str, Any]) -> str:
     return "；".join(diff)
 
 
-def _load_verify_results(book_dir: Path) -> dict[str, dict[str, Any]]:
-    """合并 verify 缓存；兼容 records/verifications/results 键名。"""
+def _load_verify_results(
+    book_dir: Path, records_by_id: dict[str, SourceRecord] | None = None
+) -> dict[str, dict[str, Any]]:
+    """每条记录的核验结论：record_id → {verdict, evidence, correction}。
+
+    优先读权威 per-run 工件 06_verify/verification_results.jsonl（由 verify 阶段
+    从 report.results 落盘，含全部记录与 PASSTHROUGH），record_id 与当前
+    records.jsonl 一一对应——从根上杜绝「跨运行按 record_id 合并缓存目录」时，
+    因全局 record_id 重排（换一次抽取序号即位移）而被陈旧 verdict 撞车污染。
+
+    仅当该工件缺失（本次改动前产出的旧书）时，才回退合并 06_verify/cache。
+    """
+    results = _load_verification_results(book_dir)
+    if results is not None:
+        return results
+    return _load_verify_results_from_cache(book_dir, records_by_id or {})
+
+
+def _load_verification_results(book_dir: Path) -> dict[str, dict[str, Any]] | None:
+    """读权威 verification_results.jsonl；文件不存在返回 None 以触发回退。"""
+    path = book_dir / "06_verify" / "verification_results.jsonl"
+    if not path.is_file():
+        return None
+    corrections = _load_correction_log(book_dir)
+    results: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if set(item.keys()) == {"header"}:
+            continue
+        rid = str(item.get("record_id") or "")
+        if not rid:
+            continue
+        results[rid] = {
+            "verdict": str(item.get("verdict") or ""),
+            "evidence": _text(item.get("evidence_quote")),
+            "correction": _format_corrections(corrections.get(rid, [])),
+        }
+    return results
+
+
+def _load_correction_log(book_dir: Path) -> dict[str, list[dict[str, Any]]]:
+    """correction_log.jsonl → 按 record_id 归组的字段级修正建议（权威 per-run）。"""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    path = book_dir / "06_verify" / "correction_log.jsonl"
+    if not path.is_file():
+        return grouped
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith('{"header"'):
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = str(entry.get("record_id") or "")
+        if rid:
+            grouped.setdefault(rid, []).append(entry)
+    return grouped
+
+
+def _format_corrections(items: list[dict[str, Any]]) -> str:
+    """字段级修正建议 → 「field：原值 → 建议值（原因）」拼接串。"""
+    segs: list[str] = []
+    for c in items:
+        field = str(c.get("field") or "")
+        original = _text(c.get("original")) or "（空）"
+        suggested = _text(c.get("suggested"))
+        reason = _text(c.get("reason"))
+        seg = f"{field}：{original} → {suggested}"
+        if reason:
+            seg += f"（{reason}）"
+        segs.append(seg)
+    return "；".join(segs)
+
+
+def _load_verify_results_from_cache(
+    book_dir: Path, records_by_id: dict[str, SourceRecord]
+) -> dict[str, dict[str, Any]]:
+    """[回退路径] 合并 06_verify/cache/*.json；旧书无权威工件时使用。
+
+    注意：跨运行 record_id 会重排，此路径可能注入陈旧 verdict，仅在缺少
+    verification_results.jsonl 时作为兜底。
+    """
     results: dict[str, dict[str, Any]] = {}
     cache_dir = book_dir / "06_verify" / "cache"
     if not cache_dir.is_dir():
@@ -219,11 +214,47 @@ def _load_verify_results(book_dir: Path) -> dict[str, dict[str, Any]]:
         response = data.get("response")
         if not isinstance(response, dict):
             continue
-        items = response.get("records") or response.get("verifications") or response.get("results") or []
+        items = (
+            response.get("records")
+            or response.get("verifications")
+            or response.get("results")
+            or []
+        )
         for item in items:
-            if isinstance(item, dict) and item.get("record_id"):
-                results[str(item["record_id"])] = item
+            if not (isinstance(item, dict) and item.get("record_id")):
+                continue
+            rid = str(item["record_id"])
+            correction = ""
+            corrected = item.get("corrected_record")
+            record = records_by_id.get(rid)
+            if isinstance(corrected, dict) and record is not None:
+                correction = _correction_diff(record, corrected)
+            results[rid] = {
+                "verdict": str(item.get("verdict") or ""),
+                "evidence": _text(item.get("source_evidence")),
+                "correction": correction,
+            }
     return results
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _render_section_path(parts: list[str]) -> str:
+    """渲染章节路径：折叠被 MinerU 误当作标题的整段表格 HTML（原表内容污染 heading）。"""
+    clean: list[str] = []
+    for raw in parts:
+        seg = str(raw).strip()
+        if not seg:
+            continue
+        lowered = seg.lower()
+        if "<" in seg and ("table" in lowered or "<td" in lowered or "<tr" in lowered):
+            seg = "（表格）"  # 整段表格 HTML：压成占位，避免在路径列刷屏
+        elif "<" in seg:
+            seg = _HTML_TAG_RE.sub("", seg).strip()
+        if seg and (not clean or clean[-1] != seg):
+            clean.append(seg)
+    return " / ".join(clean)
 
 
 def _load_validation_issues(book_dir: Path) -> dict[str, list[str]]:
@@ -251,29 +282,36 @@ def _build_rows(
     rows: list[list[Any]] = []
     for record in records:
         verify = verify_results.get(record.record_id)
-        verdict_label = ""
-        correction = ""
-        evidence = ""
         if verify is not None:
-            verdict_label = VERDICT_LABELS.get(str(verify.get("verdict") or ""), str(verify.get("verdict") or ""))
-            evidence = _text(verify.get("source_evidence"))
-            corrected = verify.get("corrected_record")
-            if isinstance(corrected, dict):
-                correction = _correction_diff(record, corrected)
+            verdict_key = str(verify.get("verdict") or "")
+            verdict_label = _pack_labels("verdict").get(verdict_key, verdict_key)
+            evidence = _text(verify.get("evidence"))
+            correction = _text(verify.get("correction"))
+        elif record.passthrough or record.record_type == "TABLE_ROW":
+            verdict_label = _pack_labels("verdict")["PASSTHROUGH"]  # 表格直通：免 B 核验
+            evidence = ""
+            correction = ""
         else:
             verdict_label = "未核验"
+            evidence = ""
+            correction = ""
         problems = validation_issues.get(record.record_id, [])
-        action_label = ACTION_LABELS.get(record.action.value, record.action.value) if record.action else ""
+        action = record.payload.get("action")
+        action_label = (
+            _pack_labels("action", record.domain_id).get(action, action) if action else ""
+        )
         rows.append(
             [
                 record.record_id,
-                TYPE_LABELS.get(record.record_type.value, record.record_type.value),
+                _pack_labels("record_type", record.domain_id).get(
+                    record.record_type, record.record_type
+                ),
                 _subject(record),
                 _related_herbs(record),
                 action_label,
                 _structured_content(record),
                 record.raw_text,
-                " / ".join(record.source.section_path),
+                _render_section_path(record.source.section_path),
                 (
                     f"{record.source.page_start}-{record.source.page_end}"
                     if record.source.page_start
@@ -325,17 +363,37 @@ def _style_review_sheet(ws: Worksheet) -> None:
     dropdown.add(f"O2:O{ws.max_row}")
 
 
-def _append_stats_sheet(ws: Worksheet, records: list[SourceRecord], verify_results: dict[str, dict[str, Any]], book_dir: Path) -> None:
-    type_counts = Counter(r.record_type.value for r in records)
-    verdict_counts = Counter(
-        VERDICT_LABELS.get(str(v.get("verdict") or ""), str(v.get("verdict") or ""))
-        for v in verify_results.values()
+def _append_stats_sheet(
+    ws: Worksheet,
+    records: list[SourceRecord],
+    verify_results: dict[str, dict[str, Any]],
+    book_dir: Path,
+) -> None:
+    settings = get_settings()
+    type_counts = Counter(r.record_type for r in records)
+    # 核验结论以权威 per-run 工件为准；passthrough/表格直通记为「直通免核验」，
+    # 不再因缓存未覆盖而虚报「未核验」，也不再把陈旧 verdict 计入。
+    verdict_keys: list[str] = []
+    for r in records:
+        v = verify_results.get(r.record_id)
+        if v is not None and v.get("verdict"):
+            verdict_keys.append(str(v["verdict"]))
+        elif r.passthrough or r.record_type == "TABLE_ROW":
+            verdict_keys.append("PASSTHROUGH")
+    verdict_counts = Counter(_pack_labels("verdict").get(k, k) for k in verdict_keys)
+    covered = len(verdict_keys)
+    unverified = len(records) - covered
+    validation_path = book_dir / "05_validate" / "validation_report.json"
+    validation = (
+        json.loads(validation_path.read_text(encoding="utf-8")) if validation_path.is_file() else {}
     )
-    unverified = sum(1 for r in records if r.record_id not in verify_results)
-    validation = json.loads((book_dir / "05_validate" / "validation_report.json").read_text(encoding="utf-8"))
     severity_counts = Counter(i.get("severity") for i in validation.get("issues", []))
-    manifest = json.loads((book_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = book_dir / "manifest.json"
+    manifest = (
+        json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    )
     cache_count = len(list((book_dir / "06_verify" / "cache").glob("*.json")))
+    verify_authoritative = (book_dir / "06_verify" / "verification_results.jsonl").is_file()
     suspicious_path = book_dir / "05_validate" / "suspicious_records.jsonl"
     suspicious_count = 0
     if suspicious_path.is_file():
@@ -348,15 +406,40 @@ def _append_stats_sheet(ws: Worksheet, records: list[SourceRecord], verify_resul
     rows = [
         ("统计项", "数值", "说明"),
         ("源文件", manifest.get("file_name") or "", "书档来源 PDF"),
-        ("流水线状态", manifest.get("status") or "", "verify 因 API 配额中断（137/146 批次已缓存）"),
-        ("模型", "deepseek-v4-flash-202605", "extract / verify 共用"),
+        (
+            "流水线状态",
+            manifest.get("status") or "",
+            "核验结论来源："
+            + (
+                "verification_results.jsonl（权威 per-run）"
+                if verify_authoritative
+                else "06_verify/cache 合并（旧书回退，可能含陈旧 verdict）"
+            ),
+        ),
+        (
+            "模型",
+            f"extract={settings.extract_llm.model} / verify={settings.verify_llm.model}",
+            "抽取与核验分别配置（可不同）",
+        ),
         ("总记录数", len(records), "04_extract/records.jsonl"),
-        *(("类型 " + TYPE_LABELS.get(k, k), v, "") for k, v in sorted(type_counts.items())),
-        ("核验覆盖", f"{len(verify_results)}/{len(records)}", f"未核验 {unverified} 条（verify 中断）"),
+        *(
+            (
+                "类型 "
+                + _pack_labels("record_type", records[0].domain_id if records else "tcm").get(k, k),
+                v,
+                "",
+            )
+            for k, v in sorted(type_counts.items())
+        ),
+        ("核验覆盖", f"{covered}/{len(records)}", f"未核验 {unverified} 条"),
         *(("核验 " + k, v, "") for k, v in sorted(verdict_counts.items(), key=lambda kv: -kv[1])),
         ("校验问题总数", sum(severity_counts.values()), "05_validate/validation_report.json"),
         *(("校验 " + k, v, "") for k, v in sorted(severity_counts.items())),
-        ("疑点记录（validate）", suspicious_count, "05_validate/suspicious_records.jsonl（ERROR 或语义升级等）"),
+        (
+            "疑点记录（validate）",
+            suspicious_count,
+            "05_validate/suspicious_records.jsonl（ERROR 或语义升级等）",
+        ),
         ("verify 缓存批次", cache_count, "06_verify/cache"),
     ]
     for row in rows:
@@ -376,10 +459,22 @@ def _append_guide_sheet(ws: Worksheet) -> None:
     rows = [
         ("填写规则", ""),
         ("1", "本表每行是一条抽取记录；黄色两列（审核结论、医生备注）由医生填写，其余列请勿修改。"),
-        ("2", "审核结论下拉选项：保留=抽取正确；修改=部分正确（请在医生备注说明，或直接修改“结构化内容/药物主体”等列）；删除=原文不支持该记录；待定=无法判断。"),
-        ("3", "粉色底“核验结论”列是模型 B 逐条比对原文的结果：已证实=原文可支撑；未获原文支持/名称规范化有误/关系抽取有误=建议重点复核；未核验=本次运行核验未完成。"),
-        ("4", "“B建议修正”列是核验模型给出的修正建议（字段：原值 → 新值），仅供参考，采纳与否由医生决定。"),
-        ("5", "“校验问题”列是确定性校验器输出的 ERROR/WARNING（如缺少结构化载荷、动作超原文上限），其中 ERROR 建议优先处理。"),
+        (
+            "2",
+            "审核结论下拉选项：保留=抽取正确；修改=部分正确（请在医生备注说明，或直接修改“结构化内容/药物主体”等列）；删除=原文不支持该记录；待定=无法判断。",
+        ),
+        (
+            "3",
+            "粉色底“核验结论”列是模型 B 逐条比对原文的结果：已证实=原文可支撑；未获原文支持/名称规范化有误/关系抽取有误=建议重点复核；直通免核验=表格逐行透传不经核验；未核验=本次运行核验未完成。",
+        ),
+        (
+            "4",
+            "“B建议修正”列是核验模型给出的修正建议（字段：原值 → 新值），仅供参考，采纳与否由医生决定。",
+        ),
+        (
+            "5",
+            "“校验问题”列是确定性校验器输出的 ERROR/WARNING（如缺少结构化载荷、动作超原文上限），其中 ERROR 建议优先处理。",
+        ),
         ("6", "证据原文为抽取依据的原文片段；如与原书不符请标“修改”并在备注说明。"),
         ("", ""),
         ("列说明", ""),
@@ -399,11 +494,41 @@ def _append_guide_sheet(ws: Worksheet) -> None:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
 
+def _append_raw_table_sheet(ws: Worksheet, blocks: list[dict]) -> None:
+    """把原表版式原样写入合并 sheet（每表一段：标题行+表头+数据行）。"""
+    ws.append(["章节", "页码", "表ID", "行", *[f"列{i + 1}" for i in range(8)]])
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+    for block in blocks:
+        content = str(block.get("content") or "")
+        if "<drawing" not in content:
+            continue
+        parsed = parse_table(content)
+        if not parsed.rows:
+            continue
+        heading = str(block.get("heading") or "")
+        positions = block.get("positions") or []
+        try:
+            page = int(str(positions[0].get("anchor"))) if positions else None
+        except (ValueError, TypeError):
+            page = None
+        tid = drawing_id(content)
+        ws.append([heading, page, tid, "表头", *parsed.headers])
+        for ridx, row in enumerate(parsed.rows, 1):
+            ws.append(["", "", "", f"数据{ridx}", *row])
+        ws.append([])
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 8
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 8
+
+
 def export_review_workbook(book_dir: Path, output: Path | None = None) -> Path:
     records = load_artifact_records(book_dir / "04_extract" / "records.jsonl", SourceRecord)
     if not records:
         raise ValueError(f"未在 {book_dir} 找到抽取记录")
-    verify_results = _load_verify_results(book_dir)
+    verify_results = _load_verify_results(book_dir, {r.record_id: r for r in records})
     validation_issues = _load_validation_issues(book_dir)
 
     rows = _build_rows(records, verify_results, validation_issues)
@@ -422,6 +547,11 @@ def export_review_workbook(book_dir: Path, output: Path | None = None) -> Path:
     ws_guide = wb.create_sheet(GUIDE_SHEET)
     _append_guide_sheet(ws_guide)
 
+    blocks_path = book_dir / "01_parse" / "blocks.jsonl"
+    if blocks_path.is_file():
+        ws_raw = wb.create_sheet(RAW_TABLE_SHEET)
+        _append_raw_table_sheet(ws_raw, load_blocks(blocks_path))
+
     if output is None:
         manifest = json.loads((book_dir / "manifest.json").read_text(encoding="utf-8"))
         stem = Path(manifest.get("file_name") or book_dir.name).stem
@@ -435,7 +565,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="导出 P0 流水线工件的医生审核版 Excel")
     parser.add_argument("--book-id", required=True, help="书籍工作区 ID（workspace/books/<id>）")
     parser.add_argument("--workspace", default=str(WORKSPACE), help="书籍工作区根目录")
-    parser.add_argument("--output", default=None, help="输出 xlsx 路径（默认 07_review/<源文件名>_医生审核版.xlsx）")
+    parser.add_argument(
+        "--output", default=None, help="输出 xlsx 路径（默认 07_review/<源文件名>_医生审核版.xlsx）"
+    )
     args = parser.parse_args()
 
     book_dir = Path(args.workspace) / args.book_id

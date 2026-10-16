@@ -58,12 +58,8 @@ VALID_TRANSITIONS: dict[BookStatus, frozenset[BookStatus]] = {
     BookStatus.PARSED: frozenset({BookStatus.PROFILING, BookStatus.FAILED}),
     BookStatus.PROFILING: frozenset({BookStatus.PROFILED, BookStatus.FAILED}),
     BookStatus.PROFILED: frozenset({BookStatus.PLAN_GENERATED, BookStatus.FAILED}),
-    BookStatus.PLAN_GENERATED: frozenset(
-        {BookStatus.WAITING_PLAN_CONFIRMATION, BookStatus.FAILED}
-    ),
-    BookStatus.WAITING_PLAN_CONFIRMATION: frozenset(
-        {BookStatus.PLAN_CONFIRMED, BookStatus.FAILED}
-    ),
+    BookStatus.PLAN_GENERATED: frozenset({BookStatus.WAITING_PLAN_CONFIRMATION, BookStatus.FAILED}),
+    BookStatus.WAITING_PLAN_CONFIRMATION: frozenset({BookStatus.PLAN_CONFIRMED, BookStatus.FAILED}),
     BookStatus.PLAN_CONFIRMED: frozenset({BookStatus.EXTRACTING, BookStatus.FAILED}),
     BookStatus.EXTRACTING: frozenset({BookStatus.EXTRACTED, BookStatus.FAILED}),
     BookStatus.EXTRACTED: frozenset({BookStatus.VALIDATING, BookStatus.FAILED}),
@@ -125,6 +121,9 @@ class BookManifest(BaseModel):
 
     schema_version: str = "1"
     book_id: str
+    domain_id: str = "tcm"  # Missing in legacy manifests means TCM.
+    record_schema_version: str = "2"
+    derived_artifacts_stale: bool = False
     file_name: str
     file_hash: str  # sha256:<hex>
     file_size: int = 0
@@ -169,9 +168,7 @@ class BookManifest(BaseModel):
         """显式回退状态（仅用于 rerun --from；下游阶段记录由调用方作废）。"""
         order = list(BookStatus)
         if order.index(to_status) >= order.index(self.status):
-            raise ValueError(
-                f"rewind 只能向后: {self.status.value} → {to_status.value}"
-            )
+            raise ValueError(f"rewind 只能向后: {self.status.value} → {to_status.value}")
         self.status = to_status
         self.error = None
         self.updated_at = _now_iso()
@@ -185,7 +182,8 @@ class BookManifest(BaseModel):
     def completed_stages(self) -> list[str]:
         """按 STAGE_ORDER 返回已完成阶段。"""
         return [
-            name for name in STAGE_ORDER
+            name
+            for name in STAGE_ORDER
             if self.stages.get(name) and self.stages[name].status == "DONE"
         ]
 

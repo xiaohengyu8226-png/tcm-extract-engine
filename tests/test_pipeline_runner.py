@@ -8,17 +8,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tcm_extract_engine.core.artifacts import load_artifact_records
-from tcm_extract_engine.core.book import BookWorkspace, sha256_file
+from tcm_extract_engine.cab.planner import PromptTemplateRegistry
+from tcm_extract_engine.core.artifacts import load_artifact, load_artifact_records
+from tcm_extract_engine.core.book import ADAPTATION_FILENAME, BookWorkspace, sha256_file
 from tcm_extract_engine.core.llm import LLMError, LLMUsage
 from tcm_extract_engine.core.manifest import BookStatus
-from tcm_extract_engine.core.records import RecordType, SourceRecord
+from tcm_extract_engine.domains.tcm.schema import RecordType
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 from tcm_extract_engine.runner import BookPipeline
 
 # ── 测试夹具 ─────────────────────────────────────────────────────────────────
@@ -42,6 +45,14 @@ class FakeLLMClient:
         item = self.queue.pop(0)
         if isinstance(item, Exception):
             raise item
+        if "核验器" in system_prompt:
+            import copy
+            import re
+
+            item = copy.deepcopy(item)
+            ids = list(dict.fromkeys(re.findall(r'"record_id":\s*"(SR-[^"]+)"', user_prompt)))
+            for row, actual_id in zip(item.get("records", []), ids):
+                row["record_id"] = actual_id
         return item
 
 
@@ -97,11 +108,17 @@ def _make_pipeline(
     books_root: Path,
     extract: FakeLLMClient | None = None,
     verify: FakeLLMClient | None = None,
+    prompt: FakeLLMClient | None = None,
+    structure: FakeLLMClient | None = None,
 ) -> BookPipeline:
     return BookPipeline(
         books_root,
         extract_client=extract or FakeLLMClient(),  # type: ignore[arg-type]
         verify_client=verify or FakeLLMClient(),  # type: ignore[arg-type]
+        # 默认空队列 fake：适配块生成即刻降级为 base-only，不触发真实网络
+        prompt_client=prompt or FakeLLMClient(),  # type: ignore[arg-type]
+        # 默认空队列 fake：大纲修复即刻降级为平铺标题，不触发真实网络
+        structure_client=structure or FakeLLMClient(),  # type: ignore[arg-type]
     )
 
 
@@ -141,7 +158,7 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     _queue_success(extract, verify, book_id)
     pipeline = _make_pipeline(tmp_path / "books", extract, verify)
 
-    manifest = asyncio.run(pipeline.run(source))
+    manifest = asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     assert manifest.status is BookStatus.WAITING_REVIEW
     assert manifest.book_id == book_id
@@ -172,7 +189,8 @@ def test_run_end_to_end(tmp_path: Path) -> None:
     # 记录内容：类型与动作正确
     records = load_artifact_records(ws.stage_artifact("extract"), SourceRecord)
     assert [r.record_type for r in records] == [
-        RecordType.GENERAL_RULE, RecordType.INTERACTION,
+        RecordType.GENERAL_RULE,
+        RecordType.INTERACTION,
     ]
 
     # 无 ERROR 校验问题 → 不产生 suspicious_records.jsonl
@@ -190,11 +208,11 @@ def test_run_is_idempotent(tmp_path: Path) -> None:
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
     pipeline = _make_pipeline(tmp_path / "books", extract, verify)
-    asyncio.run(pipeline.run(source))
+    asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     # 第二次 run：全新客户端（空队列）→ 若阶段被重跑会因队列为空而失败
     pipeline2 = _make_pipeline(tmp_path / "books")
-    manifest2 = asyncio.run(pipeline2.run(source))
+    manifest2 = asyncio.run(pipeline2.run(source, domain_id="tcm"))
 
     assert manifest2.status is BookStatus.WAITING_REVIEW
     assert manifest2.book_id == book_id
@@ -203,7 +221,7 @@ def test_run_is_idempotent(tmp_path: Path) -> None:
 def test_run_missing_source_raises(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path / "books")
     with pytest.raises(FileNotFoundError):
-        asyncio.run(pipeline.run(tmp_path / "不存在.md"))
+        asyncio.run(pipeline.run(tmp_path / "不存在.md", domain_id="tcm"))
 
 
 # ── 人工确认门 ───────────────────────────────────────────────────────────────
@@ -216,7 +234,7 @@ def test_run_stops_at_plan_confirmation_gate(tmp_path: Path) -> None:
     extract, verify = FakeLLMClient(), FakeLLMClient()
     pipeline = _make_pipeline(tmp_path / "books", extract, verify)
 
-    manifest = asyncio.run(pipeline.run(source, confirm_plan=False))
+    manifest = asyncio.run(pipeline.run(source, confirm_plan=False, domain_id="tcm"))
 
     assert manifest.status is BookStatus.WAITING_PLAN_CONFIRMATION
     assert manifest.stages["plan"].status == "DONE"
@@ -251,7 +269,7 @@ def test_run_stage_plan_skip_keeps_confirm_gate(tmp_path: Path) -> None:
     book_id = _book_id_of(source)
     extract, verify = FakeLLMClient(), FakeLLMClient()
     pipeline = _make_pipeline(tmp_path / "books", extract, verify)
-    asyncio.run(pipeline.run(source, confirm_plan=False))
+    asyncio.run(pipeline.run(source, confirm_plan=False, domain_id="tcm"))
     assert pipeline.status(book_id).status is BookStatus.WAITING_PLAN_CONFIRMATION
 
     # 重复点「生成提示词」：跳过路径也必须停在确认门，不触发 extract
@@ -267,7 +285,7 @@ def test_rerun_from_plan_can_stop_at_gate(tmp_path: Path) -> None:
     books_root = tmp_path / "books"
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
-    asyncio.run(_make_pipeline(books_root, extract, verify).run(source))
+    asyncio.run(_make_pipeline(books_root, extract, verify).run(source, domain_id="tcm"))
 
     extract2, verify2 = FakeLLMClient(), FakeLLMClient()
     manifest = asyncio.run(
@@ -295,7 +313,7 @@ def test_resume_after_verify_failure(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path / "books", extract, verify_fail)
 
     with pytest.raises(Exception, match="核验失败"):
-        asyncio.run(pipeline.run(source))
+        asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     failed = pipeline.status(book_id)
     assert failed.status is BookStatus.FAILED
@@ -321,7 +339,7 @@ def test_retry_after_extract_failure(tmp_path: Path) -> None:
     pipeline = _make_pipeline(tmp_path / "books")  # 空队列 → 抽取必失败
 
     with pytest.raises(Exception, match="批次抽取失败"):
-        asyncio.run(pipeline.run(source))
+        asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     failed = pipeline.status(book_id)
     assert failed.status is BookStatus.FAILED
@@ -347,7 +365,7 @@ def test_rerun_from_extract_reexecutes_downstream(tmp_path: Path) -> None:
     _queue_success(extract, verify, book_id)
     books_root = tmp_path / "books"
     pipeline = _make_pipeline(books_root, extract, verify)
-    asyncio.run(pipeline.run(source))
+    asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     # 作废缓存，强制重跑时真实调用 LLM
     ws = BookWorkspace(books_root, book_id)
@@ -361,7 +379,7 @@ def test_rerun_from_extract_reexecutes_downstream(tmp_path: Path) -> None:
 
     assert manifest.status is BookStatus.WAITING_REVIEW
     assert len(extract2.calls) == 2  # extract 重跑
-    assert len(verify2.calls) == 1   # verify 重跑
+    assert len(verify2.calls) == 1  # verify 重跑
     for stage in ("parse", "profile", "plan"):
         assert manifest.stages[stage].status == "DONE"  # 上游保留
     # 抽取缓存重建
@@ -375,7 +393,7 @@ def test_rerun_from_plan_clears_prompt_version(tmp_path: Path) -> None:
     books_root = tmp_path / "books"
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
-    asyncio.run(_make_pipeline(books_root, extract, verify).run(source))
+    asyncio.run(_make_pipeline(books_root, extract, verify).run(source, domain_id="tcm"))
     old_prompt_version = _make_pipeline(books_root).status(book_id).prompt_version
     assert old_prompt_version
 
@@ -409,7 +427,7 @@ def test_rewind_pops_downstream_but_keeps_artifacts(tmp_path: Path) -> None:
     books_root = tmp_path / "books"
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
-    asyncio.run(_make_pipeline(books_root, extract, verify).run(source))
+    asyncio.run(_make_pipeline(books_root, extract, verify).run(source, domain_id="tcm"))
     ws = BookWorkspace(books_root, book_id)
     assert ws.stage_artifact("verify").is_file()
 
@@ -428,7 +446,7 @@ def test_rewind_idempotent_when_status_already_at_pre_status(tmp_path: Path) -> 
     books_root = tmp_path / "books"
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
-    asyncio.run(_make_pipeline(books_root, extract, verify).run(source))
+    asyncio.run(_make_pipeline(books_root, extract, verify).run(source, domain_id="tcm"))
     ws = BookWorkspace(books_root, book_id)
 
     # 模拟 back：只回退状态到 EXTRACTED，阶段记录全部保留
@@ -451,7 +469,7 @@ def test_status_and_list_all(tmp_path: Path) -> None:
     extract, verify = FakeLLMClient(), FakeLLMClient()
     _queue_success(extract, verify, book_id)
     pipeline = _make_pipeline(tmp_path / "books", extract, verify)
-    asyncio.run(pipeline.run(source))
+    asyncio.run(pipeline.run(source, domain_id="tcm"))
 
     manifest = pipeline.status(book_id)
     assert manifest.status is BookStatus.WAITING_REVIEW
@@ -480,7 +498,9 @@ def test_locate_source_markdown_copy(tmp_path: Path) -> None:
     assert located.read_text(encoding="utf-8") == SAMPLE_MD
 
 
-def test_locate_source_pdf_magic_and_pointer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_locate_source_pdf_magic_and_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """PDF 源：%PDF 魔数走副本；复制失败退化为文本指针并回溯原路径。"""
     books_root = tmp_path / "books"
 
@@ -519,16 +539,14 @@ def test_artifact_chain_hashes(tmp_path: Path) -> None:
     extract, verify = FakeLLMClient("model-a-1"), FakeLLMClient("model-b-1")
     _queue_success(extract, verify, book_id)
     books_root = tmp_path / "books"
-    asyncio.run(_make_pipeline(books_root, extract, verify).run(source))
+    asyncio.run(_make_pipeline(books_root, extract, verify).run(source, domain_id="tcm"))
 
     ws = BookWorkspace(books_root, book_id)
 
     def _jsonl_header(path: Path) -> dict[str, Any]:
         import json as _json
 
-        first_line = next(
-            ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()
-        )
+        first_line = next(ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
         return _json.loads(first_line)["header"]
 
     extract_header = _jsonl_header(ws.stage_artifact("extract"))
@@ -543,7 +561,147 @@ def test_artifact_chain_hashes(tmp_path: Path) -> None:
     # 记录类型解析（真实 SourceRecord）
     records = load_artifact_records(ws.stage_artifact("verify"), SourceRecord)
     assert [r.record_type for r in records] == [
-        RecordType.GENERAL_RULE, RecordType.INTERACTION,
+        RecordType.GENERAL_RULE,
+        RecordType.INTERACTION,
     ]
     assert records[1].interaction is not None
     assert records[1].interaction.anchor.herb_name == "甘草"
+
+
+# ── 每书适配块（Model C LLM 参与）─────────────────────────────────────────────
+
+
+ADAPTATION_RESPONSE = {
+    "terminology_aliases": ["川乌即制川乌"],
+    "watch_points": ["剂量数字易 OCR 出错"],
+}
+
+GOAL_RESPONSE = {"goal": "中药临床应用知识抽取与规则库建设"}
+
+
+def test_plan_generates_per_book_adaptation(tmp_path: Path) -> None:
+    """开启适配：plan 生成每书适配块、prompt_version 相对 base bump、extract 用合成模板。"""
+    source = _make_source(tmp_path)
+    book_id = _book_id_of(source)
+    extract, verify = FakeLLMClient("a"), FakeLLMClient("b")
+    _queue_success(extract, verify, book_id)
+    prompt = FakeLLMClient("c")
+    # 适配块两个模板各一次，然后 goal 归纳一次（_run_plan 先适配后 goal）
+    prompt.queue = [ADAPTATION_RESPONSE, ADAPTATION_RESPONSE, GOAL_RESPONSE]
+    books_root = tmp_path / "books"
+    pipeline = _make_pipeline(books_root, extract, verify, prompt)
+    asyncio.run(pipeline.run(source, domain_id="tcm"))
+
+    ws = BookWorkspace(books_root, book_id)
+    # 1) 适配产物落盘
+    adapt_path = ws.stage_dir("plan") / ADAPTATION_FILENAME
+    assert adapt_path.is_file()
+    adapt_data = load_artifact(adapt_path)
+    assert adapt_data["profile_hash"]
+    assert "general_rule.md" in adapt_data["adaptations"]
+    assert adapt_data["adaptations"]["general_rule.md"]["block"]
+
+    # 2) prompt_version 相对 base 模板 bump（合成 hash）；goal 为每书自适应值
+    base_version = PromptTemplateRegistry().version_of("a", "general_rule.md")
+    plan = load_artifact(ws.stage_artifact("plan"))
+    gr = next(s for s in plan["sections"] if s["template"] == "general_rule.md")
+    assert gr["prompt_version"] != base_version
+    assert plan["goal"] == GOAL_RESPONSE["goal"]
+
+    # 3) extract 实际收到「base + 适配块」合成提示词；prompt 共 3 次调用（2 适配 + 1 goal）
+    assert len(prompt.calls) == 3
+    assert any("本书适配提示" in c for c in extract.calls)
+
+
+def test_plan_adaptation_cache_reuse_on_rerun(tmp_path: Path) -> None:
+    """profile 未变时重跑 plan 命中适配/goal 缓存，不再调 prompt client（可复现）。"""
+    source = _make_source(tmp_path)
+    book_id = _book_id_of(source)
+    extract, verify = FakeLLMClient("a"), FakeLLMClient("b")
+    _queue_success(extract, verify, book_id)
+    prompt = FakeLLMClient("c")
+    prompt.queue = [ADAPTATION_RESPONSE, ADAPTATION_RESPONSE, GOAL_RESPONSE]
+    books_root = tmp_path / "books"
+    pipeline = _make_pipeline(books_root, extract, verify, prompt)
+    asyncio.run(pipeline.run(source, domain_id="tcm"))
+    assert len(prompt.calls) == 3
+
+    # rewind 到 plan（适配/goal 产物保留），只重跑 plan：命中缓存，prompt 调用不增
+    pipeline.rewind(book_id, to_stage="plan")
+    asyncio.run(pipeline.run_stage(book_id, "plan", confirm_plan=False))
+    assert len(prompt.calls) == 3
+
+
+def test_plan_adaptation_degrades_on_llm_failure(tmp_path: Path) -> None:
+    """prompt client 失败 → 适配块降级为 base-only，流水线照常完成。"""
+    source = _make_source(tmp_path)
+    book_id = _book_id_of(source)
+    extract, verify = FakeLLMClient("a"), FakeLLMClient("b")
+    _queue_success(extract, verify, book_id)
+    prompt = FakeLLMClient("c")  # 空队列 → complete_json 抛 LLMError
+    books_root = tmp_path / "books"
+    pipeline = _make_pipeline(books_root, extract, verify, prompt)
+    manifest = asyncio.run(pipeline.run(source, domain_id="tcm"))
+
+    assert manifest.status is BookStatus.WAITING_REVIEW
+    ws = BookWorkspace(books_root, book_id)
+    adapt_data = load_artifact(ws.stage_dir("plan") / ADAPTATION_FILENAME)
+    assert all(a["degraded"] for a in adapt_data["adaptations"].values())
+    # 降级 → prompt_version 回落 base 版本
+    base_version = PromptTemplateRegistry().version_of("a", "general_rule.md")
+    plan = load_artifact(ws.stage_artifact("plan"))
+    gr = next(s for s in plan["sections"] if s["template"] == "general_rule.md")
+    assert gr["prompt_version"] == base_version
+    assert not any("本书适配提示" in c for c in extract.calls)
+
+
+def test_parse_applies_outline_repair(tmp_path: Path) -> None:
+    """parse 阶段大纲修复：structure 客户端排队决策 → blocks 重建 + summary 记账。"""
+    source = _make_source(tmp_path)
+    book_id = _book_id_of(source)
+    books_root = tmp_path / "books"
+    BookWorkspace.create(books_root, source)
+
+    structure = FakeLLMClient("structure")
+    structure.queue = [
+        {
+            "entries": [
+                {"level": 1, "keep": True, "title": "第一章 剂量规范"},
+                {"level": 2, "keep": True, "title": "附录C 十八反"},
+            ]
+        }
+    ]
+    pipeline = _make_pipeline(books_root, structure=structure)
+    asyncio.run(pipeline.run_stage(book_id, "parse"))
+    assert len(structure.calls) == 1
+
+    # parse summary 记录修复审计
+    parse_data = load_artifact(books_root / book_id / "01_parse" / "parse_summary.json")
+    assert parse_data["outline_repair"]["source"] == "llm"
+    assert parse_data["outline_repair"]["kept"] == 2
+
+    # blocks.jsonl 已重建：层级 1/2，meta 首行保留并盖审计标记
+    from tcm_extract_engine.cab.profiler import load_blocks
+
+    blocks_path = books_root / book_id / "01_parse" / "blocks.jsonl"
+    meta = json.loads(blocks_path.read_text(encoding="utf-8").splitlines()[0])
+    assert meta["type"] == "meta"
+    assert meta["outline_repair"]["source"] == "llm"
+    headings = {b["heading"]: b["level"] for b in load_blocks(blocks_path) if b["heading"]}
+    assert headings["第一章 剂量规范"] == 1
+    assert headings["附录C 十八反"] == 2
+
+
+def test_parse_outline_repair_degrades_silently(tmp_path: Path) -> None:
+    """structure 客户端失败 → 降级平铺标题，parse 照常完成。"""
+    source = _make_source(tmp_path)
+    book_id = _book_id_of(source)
+    books_root = tmp_path / "books"
+    BookWorkspace.create(books_root, source)
+
+    pipeline = _make_pipeline(books_root)  # structure 空队列 → LLMError → 降级
+    manifest = asyncio.run(pipeline.run_stage(book_id, "parse"))
+
+    parse_data = load_artifact(books_root / book_id / "01_parse" / "parse_summary.json")
+    assert parse_data["outline_repair"]["source"] == "degraded"
+    assert manifest.status is BookStatus.PARSED

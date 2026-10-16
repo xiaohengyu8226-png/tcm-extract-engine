@@ -21,9 +21,18 @@ import json
 import logging
 import shutil
 from pathlib import Path
+from typing import Any
 
 from tcm_extract_engine.cab.extractors import extract_records
-from tcm_extract_engine.cab.planner import PromptTemplateRegistry, build_extraction_plan
+from tcm_extract_engine.cab.planner import (
+    BookAdaptation,
+    BookAdaptedRegistry,
+    PromptTemplateRegistry,
+    build_extraction_plan,
+    generate_book_adaptations,
+    generate_book_goal,
+    templates_for_profile,
+)
 from tcm_extract_engine.cab.profiler import DocumentProfile, build_profile, load_blocks
 from tcm_extract_engine.cab.validator import validate_records
 from tcm_extract_engine.cab.verifier import verify_records
@@ -35,7 +44,12 @@ from tcm_extract_engine.core.artifacts import (
     load_artifact_records,
     save_artifact,
 )
-from tcm_extract_engine.core.book import BookWorkspace, list_books
+from tcm_extract_engine.core.book import (
+    ADAPTATION_FILENAME,
+    GOAL_FILENAME,
+    BookWorkspace,
+    list_books,
+)
 from tcm_extract_engine.core.llm import UnifiedLLMClient
 from tcm_extract_engine.core.manifest import (
     STAGE_ORDER,
@@ -43,6 +57,7 @@ from tcm_extract_engine.core.manifest import (
     BookStatus,
 )
 from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.domains import get_domain_pack
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +101,17 @@ class BookPipeline:
         registry: PromptTemplateRegistry | None = None,
         extract_client: UnifiedLLMClient | None = None,
         verify_client: UnifiedLLMClient | None = None,
+        prompt_client: UnifiedLLMClient | None = None,
+        structure_client: UnifiedLLMClient | None = None,
+        vision_client: UnifiedLLMClient | None = None,
     ) -> None:
         self.books_root = books_root or project_paths.root / "workspace" / "books"
         self.registry = registry or PromptTemplateRegistry()
         self._extract_client = extract_client
         self._verify_client = verify_client
+        self._prompt_client = prompt_client
+        self._structure_client = structure_client
+        self._vision_client = vision_client
         self._owned_clients: list[UnifiedLLMClient] = []
 
     # ── 客户端（延迟创建，便于测试注入）────────────────────────────────────
@@ -115,6 +136,38 @@ class BookPipeline:
             self._owned_clients.append(client)
         return self._verify_client
 
+    @property
+    def prompt_client(self) -> UnifiedLLMClient:
+        if self._prompt_client is None:
+            from tcm_extract_engine.common.config import get_settings
+
+            client = UnifiedLLMClient(get_settings().prompt_llm)
+            self._prompt_client = client
+            self._owned_clients.append(client)
+        return self._prompt_client
+
+    @property
+    def structure_client(self) -> UnifiedLLMClient:
+        """大纲修复专用 C-LLM 客户端（独立实例，与 prompt_client 各计各的调用数）。"""
+        if self._structure_client is None:
+            from tcm_extract_engine.common.config import get_settings
+
+            client = UnifiedLLMClient(get_settings().prompt_llm)
+            self._structure_client = client
+            self._owned_clients.append(client)
+        return self._structure_client
+
+    @property
+    def vision_client(self) -> UnifiedLLMClient:
+        """多模态视觉客户端（图片批次专用，回退链见 settings.vision_llm）。"""
+        if self._vision_client is None:
+            from tcm_extract_engine.common.config import get_settings
+
+            client = UnifiedLLMClient(get_settings().vision_llm)
+            self._vision_client = client
+            self._owned_clients.append(client)
+        return self._vision_client
+
     async def close(self) -> None:
         for client in self._owned_clients:
             await client.close()
@@ -123,10 +176,10 @@ class BookPipeline:
     # ── 对外入口 ──────────────────────────────────────────────────────────
 
     async def run(
-        self, source: Path, *, confirm_plan: bool = True
+        self, source: Path, *, confirm_plan: bool = True, domain_id: str = "general"
     ) -> BookManifest:
         """新建（或复用）书籍工作目录并跑到 verify 完成。"""
-        ws = BookWorkspace.create(self.books_root, source)
+        ws = BookWorkspace.create(self.books_root, source, domain_id=domain_id)
         manifest = ws.load_manifest()
         return await self._execute(ws, manifest, confirm_plan=confirm_plan)
 
@@ -175,6 +228,23 @@ class BookPipeline:
             manifest.stages.pop(stage, None)
         if to_stage == "plan":
             manifest.prompt_version = None
+        manifest.save(ws.book_dir)
+        return manifest
+
+    def invalidate_from(self, book_id: str, stage: str) -> BookManifest:
+        """作废 stage 及下游阶段记录；不回退状态（供蓝图/适配块编辑作废下游用）。
+
+        与 ``rewind`` 的区别：不触碰 manifest.status —— 编辑发生在
+        WAITING_PLAN_CONFIRMATION 确认门内（已解锁），作废下游后仍需人工
+        重新确认才能再次抽取。
+        """
+        if stage not in STAGE_ORDER:
+            raise ValueError(f"未知阶段: {stage}")
+        ws = self._workspace(book_id)
+        manifest = ws.load_manifest()
+        idx = STAGE_ORDER.index(stage)
+        for s in STAGE_ORDER[idx:]:
+            manifest.stages.pop(s, None)
         manifest.save(ws.book_dir)
         return manifest
 
@@ -229,9 +299,7 @@ class BookPipeline:
     ) -> BookManifest:
         """顺序执行未完成的阶段；单阶段失败 → FAILED 并抛出。"""
         for stage in AUTO_STAGES:
-            stop = await self._run_one_stage(
-                ws, manifest, stage, confirm_plan=confirm_plan
-            )
+            stop = await self._run_one_stage(ws, manifest, stage, confirm_plan=confirm_plan)
             if stop:  # 停在计划确认门
                 return manifest
         logger.info("[Book %s] 自动阶段全部完成（WAITING_REVIEW）", ws.book_id)
@@ -281,12 +349,18 @@ class BookPipeline:
             if stage == "plan" and not confirm_plan:
                 post = BookStatus.WAITING_PLAN_CONFIRMATION
             _advance_status(manifest, post)
+            if stage == "verify":
+                manifest.derived_artifacts_stale = False
             manifest.save(ws.book_dir)
+            if stage == "verify":
+                from tcm_extract_engine.core.export import export_knowledge
+                export_knowledge(ws.book_dir)
             logger.info("[Book %s] %s 完成", ws.book_id, stage)
             if manifest.status == BookStatus.WAITING_PLAN_CONFIRMATION:
                 logger.info(
                     "[Book %s] 计划待人工确认（tcm-engine book confirm %s）",
-                    ws.book_id, ws.book_id,
+                    ws.book_id,
+                    ws.book_id,
                 )
                 return True
             return False
@@ -300,7 +374,7 @@ class BookPipeline:
     # ── 阶段实现 ──────────────────────────────────────────────────────────
 
     async def _run_parse(self, ws: BookWorkspace, manifest: BookManifest) -> None:
-        """解析：MinerU/Markdown → blocks.jsonl。"""
+        """解析：MinerU/Markdown → blocks.jsonl（+ C-LLM 大纲修复）。"""
         from tcm_extract_engine.parse.mineru import ensure_parse_artifact
 
         source = self._locate_source(ws, manifest)
@@ -314,7 +388,44 @@ class BookPipeline:
             "cache_hit": result.cache_hit,
             "source_file": str(source),
             "file_hash": manifest.file_hash,
+            # 记账用：MINERU_FALLBACK_TO_PIPELINE 会静默降级，而不同 backend 的标题检出
+            # 并不等价；只记请求值会让人以为拿到的是 hybrid 产物。Markdown 直转为 None。
+            "mineru_backend_used": result.mineru_backend_used,
+            "mineru_degraded": result.mineru_degraded,
         }
+
+        # 大纲修复：解析器标题层级平铺（text_level 仅 1/2）。书签优先——PDF 内嵌
+        # 大纲可用时确定性定级（零 LLM）；否则由 C-LLM 按语义重建章/节/条层级并
+        # 剔除目录/前言等假标题；失败或禁用时 blocks 保持原样，流水线不中断。
+        # 修复合法的路径重写 blocks.jsonl（保留 meta 首行）。
+        from tcm_extract_engine.cab.outline import (
+            load_pdf_outline,
+            repair_blocks,
+            rewrite_blocks_file,
+        )
+        from tcm_extract_engine.cab.profiler import load_blocks
+        from tcm_extract_engine.common.config import get_settings
+
+        outline_note: dict | None = None
+        if get_settings().structure_repair_enabled:
+            settings = get_settings()
+            bookmarks: list[dict[str, Any]] | None = None
+            if settings.structure_bookmarks_enabled and source.suffix.lower() == ".pdf":
+                bookmarks = load_pdf_outline(source)
+            blocks = load_blocks(blocks_dest)
+            blocks, repair_meta = await repair_blocks(
+                blocks,
+                client=self.structure_client,
+                registry=self.registry,
+                cache_dir=ws.stage_dir("parse") / "cache",
+                bookmarks=bookmarks,
+            )
+            outline_note = repair_meta.to_dict()
+            summary["outline_repair"] = outline_note
+            if repair_meta.source in {"llm", "cache", "bookmarks", "numbering"}:
+                rewrite_blocks_file(blocks_dest, blocks, meta_note=outline_note)
+                summary["block_count"] = len(blocks)
+
         save_artifact(
             ws.stage_artifact("parse"),
             header=self._header(manifest, "parse"),
@@ -324,27 +435,44 @@ class BookPipeline:
     async def _run_profile(self, ws: BookWorkspace, manifest: BookManifest) -> None:
         """画像：blocks → document_profile.json。"""
         blocks_path = ws.stage_dir("parse") / "blocks.jsonl"
-        profile = build_profile(blocks_path, book_name=manifest.file_name)
+        profile = build_profile(
+            blocks_path, book_name=manifest.file_name, pack=get_domain_pack(manifest.domain_id)
+        )
         manifest.source_type = profile.document_type.value
         save_artifact(
             ws.stage_artifact("profile"),
-            header=self._header(manifest, "profile",
-                                upstream=_artifact_digest(ws.stage_artifact("parse"))),
+            header=self._header(
+                manifest, "profile", upstream=_artifact_digest(ws.stage_artifact("parse"))
+            ),
             data=profile.model_dump(mode="json"),
         )
 
     async def _run_plan(
         self, ws: BookWorkspace, manifest: BookManifest, *, confirm_plan: bool = True
     ) -> None:
-        """计划：profile → extraction_plan.json（Model C，确定性规则）。"""
+        """计划：profile → extraction_plan.json（Model C：确定性规则 + 每书 LLM 适配块）。"""
         profile_data = load_artifact(ws.stage_artifact("profile"))
         profile = DocumentProfile.model_validate(profile_data)
-        plan = build_extraction_plan(profile, registry=self.registry)
+
+        # 每书适配块（缓存优先，按 profile hash 命中；关闭或全降级则空）
+        adaptations = await self._resolve_adaptations(ws, manifest, profile)
+        registry = BookAdaptedRegistry(
+            {t: a.block for t, a in adaptations.items() if a.block},
+            prompts_root=self.registry.prompts_root,
+        )
+
+        # 每书 goal（Model C 归纳，缓存优先；失败/关闭回退领域包默认）
+        goal = await self._resolve_goal(ws, manifest, profile)
+
+        plan = build_extraction_plan(
+            profile, registry=registry, goal=goal, pack=get_domain_pack(manifest.domain_id)
+        )
         save_artifact(
             ws.stage_artifact("plan"),
-            header=self._header(manifest, "plan",
-                                upstream=_artifact_digest(ws.stage_artifact("profile"))),
-            data=plan.model_dump(mode="json"),
+            header=self._header(
+                manifest, "plan", upstream=_artifact_digest(ws.stage_artifact("profile"))
+            ),
+            data={**plan.model_dump(mode="json"), "domain_id": manifest.domain_id},
         )
         # 幂等键的 prompt 版本：全部计划章节 prompt_version 的合成 hash
         versions = sorted({s.prompt_version for s in plan.sections if s.prompt_version})
@@ -352,22 +480,148 @@ class BookPipeline:
             artifact_hash({"prompt_versions": versions})[:20] if versions else None
         )
 
+    async def _resolve_adaptations(
+        self, ws: BookWorkspace, manifest: BookManifest, profile: DocumentProfile
+    ) -> dict[str, BookAdaptation]:
+        """载入或生成本书适配块。
+
+        - 缓存命中（profile_hash 一致）→ 直接复用，LLM 零调用（可复现）。
+        - 开关关闭 → 空适配（base-only），并清理遗留产物保证与 extract 一致。
+        - 否则调 C-LLM 生成并落盘；整体失败优雅降级为 base-only（不阻断流水线）。
+        """
+        from tcm_extract_engine.common.config import get_settings
+
+        adapt_path = self._adaptation_path(ws)
+        profile_hash = artifact_hash(profile.model_dump(mode="json"))
+
+        # 1) 缓存命中：profile 未变 → 复用
+        if adapt_path.is_file():
+            try:
+                cached = load_artifact(adapt_path)
+            except Exception:  # noqa: BLE001 - 坏缓存视为无
+                cached = None
+            if cached and cached.get("profile_hash") == profile_hash:
+                return _parse_adaptations(cached)
+
+        # 2) 开关关闭 → 空适配，清理遗留文件（防 extract 误注入旧适配块）
+        if not get_settings().plan_adaptation_enabled:
+            adapt_path.unlink(missing_ok=True)
+            return {}
+
+        # 3) 生成
+        templates = templates_for_profile(profile)
+        if not templates:
+            adapt_path.unlink(missing_ok=True)
+            return {}
+        try:
+            adaptations = await generate_book_adaptations(
+                profile=profile,
+                templates=templates,
+                client=self.prompt_client,
+                registry=self.registry,
+            )
+        except Exception as exc:  # noqa: BLE001 - 整体失败降级为 base-only
+            logger.warning("[Book %s] 适配块生成失败，降级为 base-only: %s", ws.book_id, exc)
+            adapt_path.unlink(missing_ok=True)
+            return {}
+
+        save_artifact(
+            adapt_path,
+            header=self._header(manifest, "plan", model=self.prompt_client.model),
+            data={
+                "profile_hash": profile_hash,
+                "adaptations": {t: a.model_dump(mode="json") for t, a in adaptations.items()},
+            },
+        )
+        return adaptations
+
+    def _adaptation_path(self, ws: BookWorkspace) -> Path:
+        return ws.stage_dir("plan") / ADAPTATION_FILENAME
+
+    async def _resolve_goal(
+        self, ws: BookWorkspace, manifest: BookManifest, profile: DocumentProfile
+    ) -> str:
+        """载入或生成本书 goal（每书自适应；缓存按 profile_hash）。
+
+        - 缓存命中（profile_hash 一致且 goal 非空）→ 复用，LLM 零调用。
+        - 开关关闭 → 回退领域包默认（返回 ""），并清理遗留产物。
+        - 否则调 C-LLM 归纳并落盘；失败优雅降级为 ""（build_extraction_plan 回退默认）。
+        """
+        from tcm_extract_engine.common.config import get_settings
+
+        goal_path = self._goal_path(ws)
+        profile_hash = artifact_hash(profile.model_dump(mode="json"))
+
+        # 1) 缓存命中：profile 未变 → 复用
+        if goal_path.is_file():
+            try:
+                cached = load_artifact(goal_path)
+            except Exception:  # noqa: BLE001 - 坏缓存视为无
+                cached = None
+            if cached and cached.get("profile_hash") == profile_hash:
+                goal = str(cached.get("goal") or "").strip()
+                if goal:
+                    return goal
+
+        # 2) 开关关闭 → 回退领域包默认，清理遗留文件
+        if not get_settings().plan_goal_enabled:
+            goal_path.unlink(missing_ok=True)
+            return ""
+
+        # 3) 生成（generate_book_goal 内部已优雅降级；空结果不落盘）
+        goal = await generate_book_goal(
+            profile=profile, client=self.prompt_client, registry=self.registry
+        )
+        if goal:
+            save_artifact(
+                goal_path,
+                header=self._header(manifest, "plan", model=self.prompt_client.model),
+                data={"profile_hash": profile_hash, "goal": goal},
+            )
+        return goal
+
+    def _goal_path(self, ws: BookWorkspace) -> Path:
+        return ws.stage_dir("plan") / GOAL_FILENAME
+
+    def _extract_registry(self, ws: BookWorkspace) -> PromptTemplateRegistry:
+        """由已落盘适配块重建注入 registry；无适配块则用 base registry。
+
+        与 _run_plan 的适配状态保持一致（plan 写、extract 读同一产物），
+        保证 resume/独立进程重跑 extract 时合成 prompt_version 与缓存键自洽。
+        """
+        adapt_path = self._adaptation_path(ws)
+        if not adapt_path.is_file():
+            return self.registry
+        try:
+            data = load_artifact(adapt_path)
+        except Exception:  # noqa: BLE001 - 坏文件退回 base
+            return self.registry
+        blocks = {t: a.block for t, a in _parse_adaptations(data).items() if a.block}
+        if not blocks:
+            return self.registry
+        return BookAdaptedRegistry(blocks, prompts_root=self.registry.prompts_root)
+
     async def _run_extract(self, ws: BookWorkspace, manifest: BookManifest) -> None:
-        """抽取（Model A）：plan + blocks → records.jsonl。"""
+        """抽取（Model A）：plan + blocks → records.jsonl（叠加每书适配块）。"""
         records = await extract_records(
             book_id=ws.book_id,
             blocks_path=ws.stage_dir("parse") / "blocks.jsonl",
             plan_path=ws.stage_artifact("plan"),
             cache_dir=ws.stage_dir("extract") / "cache",
             client=self.extract_client,
-            registry=self.registry,
+            vision_client=self.vision_client,
+            registry=self._extract_registry(ws),
+            pack=get_domain_pack(manifest.domain_id),
         )
         save_artifact(
             ws.stage_artifact("extract"),
-            header=self._header(manifest, "extract",
-                                model=self.extract_client.model,
-                                prompt_version=manifest.prompt_version,
-                                upstream=_artifact_digest(ws.stage_artifact("plan"))),
+            header=self._header(
+                manifest,
+                "extract",
+                model=self.extract_client.model,
+                prompt_version=manifest.prompt_version,
+                upstream=_artifact_digest(ws.stage_artifact("plan")),
+            ),
             data={"record_count": len(records)},
             records=records,
         )
@@ -376,7 +630,7 @@ class BookPipeline:
         """确定性校验：records → validation_report.json + suspicious_records.jsonl。"""
         records = load_artifact_records(ws.stage_artifact("extract"), SourceRecord)
         blocks = load_blocks(ws.stage_dir("parse") / "blocks.jsonl")
-        report = validate_records(records, blocks=blocks)
+        report = validate_records(records, blocks=blocks, pack=get_domain_pack(manifest.domain_id))
 
         # ERROR 记录就地标记复核（记录不删除，人工决定）
         suspicious_ids = {i.record_id for i in report.issues if i.severity.value == "ERROR"}
@@ -392,38 +646,67 @@ class BookPipeline:
             )
         save_artifact(
             ws.stage_artifact("validate"),
-            header=self._header(manifest, "validate",
-                                upstream=_artifact_digest(ws.stage_artifact("extract"))),
+            header=self._header(
+                manifest, "validate", upstream=_artifact_digest(ws.stage_artifact("extract"))
+            ),
             data=report.model_dump(mode="json"),
         )
 
     async def _run_verify(self, ws: BookWorkspace, manifest: BookManifest) -> None:
         """核验（Model B）：records + blocks → verified_records + correction_log。"""
         records = load_artifact_records(ws.stage_artifact("extract"), SourceRecord)
+        validation_path = ws.stage_artifact("validate")
+        if validation_path.is_file():
+            validation = load_artifact(validation_path)
+            flagged = {i["record_id"] for i in validation.get("issues", []) if i.get("severity") in {"ERROR", "WARNING"}}
+            for record in records:
+                if record.record_id in flagged:
+                    record.needs_review = True
         report = await verify_records(
             records=records,
             blocks_path=ws.stage_dir("parse") / "blocks.jsonl",
             client=self.verify_client,
+            vision_client=self.vision_client,
+            pack=get_domain_pack(manifest.domain_id),
             registry=self.registry,
             cache_dir=ws.stage_dir("verify") / "cache",
         )
         save_artifact(
             ws.stage_artifact("verify"),
-            header=self._header(manifest, "verify",
-                                model=self.verify_client.model,
-                                prompt_version=self.registry.version_of("b", "factual_verifier.md"),
-                                upstream=_artifact_digest(ws.stage_artifact("validate"))),
-            data={"record_count": len(records),
-                  "needs_review_count": sum(1 for r in records if r.needs_review)},
+            header=self._header(
+                manifest,
+                "verify",
+                model=self.verify_client.model,
+                prompt_version=self.registry.version_of("b", "factual_verifier.md"),
+                upstream=_artifact_digest(ws.stage_artifact("validate")),
+            ),
+            data={
+                "record_count": len(records),
+                "needs_review_count": sum(1 for r in records if r.needs_review),
+            },
             records=records,
         )
-        if report.corrections:
-            save_artifact(
-                ws.stage_dir("verify") / "correction_log.jsonl",
-                header=self._header(manifest, "verify"),
-                data={"correction_count": len(report.corrections)},
-                records=report.corrections,
-            )
+        save_artifact(
+            ws.stage_dir("verify") / "correction_log.jsonl",
+            header=self._header(manifest, "verify"),
+            data={"correction_count": len(report.corrections)},
+            records=report.corrections,
+        )
+        # 权威 per-run verdict 工件：逐条核验结论（含全部 passthrough）落盘，供 review
+        # 导出直接按 record_id 读取。避免下游合并原始缓存目录时，因全局 record_id 重排
+        # 而被上一运行的陈旧 verdict 撞车污染（历史 WRONG_NORMALIZATION 1→48 即此因）。
+        save_artifact(
+            ws.stage_dir("verify") / "verification_results.jsonl",
+            header=self._header(
+                manifest,
+                "verify",
+                model=self.verify_client.model,
+                prompt_version=self.registry.version_of("b", "factual_verifier.md"),
+            ),
+            data={"total": report.total, "verdict_counts": report.verdict_counts()},
+            records=report.results,
+        )
+
 
     # ── 工具 ──────────────────────────────────────────────────────────────
 
@@ -463,6 +746,11 @@ class BookPipeline:
             model=model,
             prompt_version=prompt_version,
             upstream_hash=upstream,
+            extra={
+                "domain_id": manifest.domain_id,
+                "pack_version": get_domain_pack(manifest.domain_id).version,
+                "record_schema_version": "2",
+            },
         )
 
 
@@ -529,12 +817,29 @@ def _artifact_digest(path: Path) -> str:
     return artifact_hash(body)
 
 
+def _parse_adaptations(data: dict[str, Any]) -> dict[str, BookAdaptation]:
+    """从适配产物（load_artifact 结果）解析 template → BookAdaptation。"""
+    raw = data.get("adaptations") or {}
+    out: dict[str, BookAdaptation] = {}
+    if isinstance(raw, dict):
+        for template, payload in raw.items():
+            if isinstance(payload, dict):
+                out[str(template)] = BookAdaptation.model_validate(payload)
+    return out
+
+
 def _record_count(artifact_path: Path) -> int | None:
     """从 Artifact 提取记录数（供 StageRecord.records）。"""
     if artifact_path.suffix == ".jsonl":
         if artifact_path.name == "verified_records.jsonl":
             return None  # 与 extract 相同数量，不重复统计
-        return max(sum(1 for line in artifact_path.read_text(encoding="utf-8").splitlines() if line.strip()) - 1, 0)
+        return max(
+            sum(
+                1 for line in artifact_path.read_text(encoding="utf-8").splitlines() if line.strip()
+            )
+            - 1,
+            0,
+        )
     data = load_artifact(artifact_path)
     for key in ("record_count", "total_records", "total", "block_count", "total_blocks"):
         value = data.get(key)

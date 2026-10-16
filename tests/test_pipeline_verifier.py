@@ -15,14 +15,14 @@ from tcm_extract_engine.cab.verifier import (
     verify_records,
 )
 from tcm_extract_engine.core.llm import LLMError, LLMUsage
-from tcm_extract_engine.core.records import (
+from tcm_extract_engine.domains.tcm.schema import (
     ActionLevel,
     HerbDose,
     InteractionGroup,
     InteractionMember,
     RecordType,
-    SourceRecord,
 )
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 
 
 class FakeLLMClient:
@@ -53,15 +53,23 @@ def _write_blocks(tmp_path: Path) -> Path:
     blocks = [
         {"type": "meta", "version": "1.0"},
         {
-            "type": "content", "blockid": "b1", "format": "plain_text",
-            "content": "甘草反甘遂、大戟、芫花、海藻。", "heading": "附录C 十八反、十九畏",
-            "parent_headings": [], "level": 2,
+            "type": "content",
+            "blockid": "b1",
+            "format": "plain_text",
+            "content": "甘草反甘遂、大戟、芫花、海藻。",
+            "heading": "附录C 十八反、十九畏",
+            "parent_headings": [],
+            "level": 2,
             "positions": [{"type": "bbox", "anchor": "40", "range": [0, 0, 1, 1]}],
         },
         {
-            "type": "content", "blockid": "b2", "format": "plain_text",
-            "content": "制川乌 3～15g，先煎。", "heading": "4.4 剂量规范要求",
-            "parent_headings": [], "level": 2,
+            "type": "content",
+            "blockid": "b2",
+            "format": "plain_text",
+            "content": "制川乌 3～15g，先煎。",
+            "heading": "4.4 剂量规范要求",
+            "parent_headings": [],
+            "level": 2,
             "positions": [{"type": "bbox", "anchor": "12", "range": [0, 0, 1, 1]}],
         },
     ]
@@ -117,18 +125,26 @@ def test_verify_supported(tmp_path: Path) -> None:
     blocks_path = _write_blocks(tmp_path)
     record = make_interaction_record()
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{
-            "record_id": record.record_id,
-            "verdict": "SUPPORTED",
-            "source_evidence": "甘草反甘遂、大戟、芫花、海藻",
-            "needs_human_review": False,
-        }],
-    }]
+    client.queue = [
+        {
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "verdict": "SUPPORTED",
+                    "source_evidence": "甘草反甘遂、大戟、芫花、海藻",
+                    "needs_human_review": False,
+                }
+            ],
+        }
+    ]
 
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
 
     assert client.calls == 1
     assert report.total == 1
@@ -143,19 +159,32 @@ def test_verify_unsupported_marks_review(tmp_path: Path) -> None:
     blocks_path = _write_blocks(tmp_path)
     record = make_interaction_record()
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{
-            "record_id": record.record_id,
-            "verdict": "UNSUPPORTED",
-            "issues": [{"field": "interaction.members",
-                        "problem": "原文未提及海藻", "source_evidence": None}],
-            "needs_human_review": True,
-        }],
-    }]
+    client.queue = [
+        {
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "verdict": "UNSUPPORTED",
+                    "issues": [
+                        {
+                            "field": "interaction.members",
+                            "problem": "原文未提及海藻",
+                            "source_evidence": None,
+                        }
+                    ],
+                    "needs_human_review": True,
+                }
+            ],
+        }
+    ]
 
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
 
     assert report.results[0].verdict == Verdict.UNSUPPORTED
     assert record.needs_review is True
@@ -167,12 +196,18 @@ def test_verify_lowercase_verdict_normalized(tmp_path: Path) -> None:
     blocks_path = _write_blocks(tmp_path)
     record = make_interaction_record()
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{"record_id": record.record_id, "verdict": "supported"}],
-    }]
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    client.queue = [
+        {
+            "records": [{"record_id": record.record_id, "verdict": "supported"}],
+        }
+    ]
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert report.results[0].verdict == Verdict.SUPPORTED
 
 
@@ -180,12 +215,18 @@ def test_verify_unknown_verdict_falls_back_partial(tmp_path: Path) -> None:
     blocks_path = _write_blocks(tmp_path)
     record = make_interaction_record()
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{"record_id": record.record_id, "verdict": "也许吧"}],
-    }]
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    client.queue = [
+        {
+            "records": [{"record_id": record.record_id, "verdict": "也许吧"}],
+        }
+    ]
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert report.results[0].verdict == Verdict.PARTIAL
     assert record.needs_review is True  # 无法解析 → 复核
 
@@ -198,46 +239,63 @@ def test_verify_correction_log_not_applied_to_record(tmp_path: Path) -> None:
     record = make_dosage_record()  # min=150, max=3（错误值）
     original_dump = record.model_dump(mode="json")
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{
-            "record_id": record.record_id,
-            "verdict": "WRONG_DOSE",
-            "issues": [{"field": "dose", "problem": "原文为 3～15g",
-                        "source_evidence": "制川乌 3～15g，先煎"}],
-            "corrected_record": {
-                "record_type": "DOSAGE",
-                "herb_name": "制川乌",
-                "dose": {"min_dose": 3, "max_dose": 15, "unit": "g",
-                         "special_note": "先煎"},
-            },
-            "needs_human_review": True,
-        }],
-    }]
+    client.queue = [
+        {
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "verdict": "WRONG_DOSE",
+                    "issues": [
+                        {
+                            "field": "dose",
+                            "problem": "原文为 3～15g",
+                            "source_evidence": "制川乌 3～15g，先煎",
+                        }
+                    ],
+                    "corrected_record": {
+                        "record_type": "DOSAGE",
+                        "herb_name": "制川乌",
+                        "dose": {
+                            "min_dose": 3,
+                            "max_dose": 15,
+                            "unit": "g",
+                            "special_note": "先煎",
+                        },
+                    },
+                    "needs_human_review": True,
+                }
+            ],
+        }
+    ]
 
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
 
     # 记录的事实内容不被修改（修正待人工确认；needs_review 是允许更新的质量标记）
     original_facts = {
-        k: v for k, v in original_dump.items()
+        k: v
+        for k, v in original_dump.items()
         if k not in {"needs_review", "confidence", "ambiguities"}
     }
     current_facts = {
-        k: v for k, v in record.model_dump(mode="json").items()
+        k: v
+        for k, v in record.model_dump(mode="json").items()
         if k not in {"needs_review", "confidence", "ambiguities"}
     }
     assert current_facts == original_facts
     assert record.needs_review is True
 
     # 修正进入 correction_log
-    assert len(report.corrections) == 1
-    entry = report.corrections[0]
-    assert entry.field == "dose"
-    assert entry.original["min_dose"] == 150
-    assert entry.suggested["min_dose"] == 3
-    assert entry.suggested["max_dose"] == 15
-    assert entry.verdict == Verdict.WRONG_DOSE
+    assert len(report.corrections) == 2
+    corrections = {entry.field: entry for entry in report.corrections}
+    assert corrections["/payload/dose/min_dose"].original == 150
+    assert corrections["/payload/dose/min_dose"].suggested == 3
+    assert corrections["/payload/dose/max_dose"].suggested == 15
 
 
 def test_verify_correction_invalid_goes_to_manual(tmp_path: Path) -> None:
@@ -245,16 +303,24 @@ def test_verify_correction_invalid_goes_to_manual(tmp_path: Path) -> None:
     blocks_path = _write_blocks(tmp_path)
     record = make_dosage_record()
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{
-            "record_id": record.record_id,
-            "verdict": "WRONG_DOSE",
-            "corrected_record": {"dose": "不是对象"},
-        }],
-    }]
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    client.queue = [
+        {
+            "records": [
+                {
+                    "record_id": record.record_id,
+                    "verdict": "WRONG_DOSE",
+                    "corrected_record": {"dose": "不是对象"},
+                }
+            ],
+        }
+    ]
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert len(report.corrections) == 1
     assert report.corrections[0].field == "(record)"
     assert "转人工" in report.corrections[0].reason
@@ -269,9 +335,13 @@ def test_verify_no_source_skips_llm(tmp_path: Path) -> None:
     record = make_interaction_record(source={"page_start": 40})
     client = FakeLLMClient()  # 队列为空
 
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert client.calls == 0
     assert report.results[0].verdict == Verdict.UNSUPPORTED
     assert record.needs_review is True
@@ -284,12 +354,18 @@ def test_verify_falls_back_to_block_ids(tmp_path: Path) -> None:
         source={"page_start": 40, "block_ids": ["b1"], "section_path": []}
     )
     client = FakeLLMClient()
-    client.queue = [{
-        "records": [{"record_id": record.record_id, "verdict": "SUPPORTED"}],
-    }]
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    client.queue = [
+        {
+            "records": [{"record_id": record.record_id, "verdict": "SUPPORTED"}],
+        }
+    ]
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert client.calls == 1  # 定位成功 → 送 LLM
     assert report.results[0].verdict == Verdict.SUPPORTED
 
@@ -304,9 +380,13 @@ def test_verify_missing_result_fallback(tmp_path: Path) -> None:
     client = FakeLLMClient()
     client.queue = [{"records": []}]  # B 返回空
 
-    report = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert report.total == 1
     assert report.results[0].verdict == Verdict.PARTIAL
     assert "漏答" in (report.results[0].explanation or "")
@@ -325,10 +405,15 @@ def test_verify_multiple_records_batched(tmp_path: Path) -> None:
     ]
 
     progress: list[tuple[int, int]] = []
-    report = asyncio.run(verify_records(
-        records=[r1, r2], blocks_path=blocks_path, client=client,
-        batch_size=1, on_progress=lambda d, t: progress.append((d, t)),
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[r1, r2],
+            blocks_path=blocks_path,
+            client=client,
+            batch_size=1,
+            on_progress=lambda d, t: progress.append((d, t)),
+        )
+    )
 
     assert client.calls == 2
     assert progress == [(1, 2), (2, 2)]
@@ -343,9 +428,13 @@ def test_verify_batch_failure_raises(tmp_path: Path) -> None:
     client.queue = [LLMError("api", "模拟核验失败")]
 
     with pytest.raises(VerificationError, match="1/1"):
-        asyncio.run(verify_records(
-            records=[record], blocks_path=blocks_path, client=client,
-        ))
+        asyncio.run(
+            verify_records(
+                records=[record],
+                blocks_path=blocks_path,
+                client=client,
+            )
+        )
 
 
 def test_verify_cache_reuse(tmp_path: Path) -> None:
@@ -355,17 +444,29 @@ def test_verify_cache_reuse(tmp_path: Path) -> None:
     cache_dir = tmp_path / "vcache"
 
     first = FakeLLMClient()
-    first.queue = [{
-        "records": [{"record_id": record.record_id, "verdict": "SUPPORTED"}],
-    }]
-    report1 = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=first, cache_dir=cache_dir,
-    ))
+    first.queue = [
+        {
+            "records": [{"record_id": record.record_id, "verdict": "SUPPORTED"}],
+        }
+    ]
+    report1 = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=first,
+            cache_dir=cache_dir,
+        )
+    )
 
     second = FakeLLMClient()  # 队列为空：未命中缓存会抛错
-    report2 = asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=second, cache_dir=cache_dir,
-    ))
+    report2 = asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=second,
+            cache_dir=cache_dir,
+        )
+    )
     assert second.calls == 0
     assert report2.verdict_counts() == report1.verdict_counts()
 
@@ -378,9 +479,14 @@ def test_verify_records_content_change_invalidates_cache(tmp_path: Path) -> None
 
     first = FakeLLMClient()
     first.queue = [{"records": [{"record_id": record.record_id, "verdict": "SUPPORTED"}]}]
-    asyncio.run(verify_records(
-        records=[record], blocks_path=blocks_path, client=first, cache_dir=cache_dir,
-    ))
+    asyncio.run(
+        verify_records(
+            records=[record],
+            blocks_path=blocks_path,
+            client=first,
+            cache_dir=cache_dir,
+        )
+    )
 
     # 记录内容变化（成员数不同）
     changed = make_interaction_record(
@@ -392,9 +498,14 @@ def test_verify_records_content_change_invalidates_cache(tmp_path: Path) -> None
     )
     second = FakeLLMClient()
     second.queue = [{"records": [{"record_id": changed.record_id, "verdict": "PARTIAL"}]}]
-    report = asyncio.run(verify_records(
-        records=[changed], blocks_path=blocks_path, client=second, cache_dir=cache_dir,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[changed],
+            blocks_path=blocks_path,
+            client=second,
+            cache_dir=cache_dir,
+        )
+    )
     assert second.calls == 1  # 缓存未命中
     assert report.verdict_counts() == {"PARTIAL": 1}
 
@@ -403,9 +514,52 @@ def test_verify_summary_and_empty_records(tmp_path: Path) -> None:
     """空记录列表：零调用、零结果。"""
     blocks_path = _write_blocks(tmp_path)
     client = FakeLLMClient()
-    report = asyncio.run(verify_records(
-        records=[], blocks_path=blocks_path, client=client,
-    ))
+    report = asyncio.run(
+        verify_records(
+            records=[],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
     assert client.calls == 0
     assert report.total == 0
     assert "0 条记录" in report.summary()
+
+
+def test_verify_budget_exhausted_splits_batch(tmp_path: Path) -> None:
+    """空响应（输出预算耗尽）→ 递归拆半，合并子批结果。"""
+    blocks_path = _write_blocks(tmp_path)
+    r1 = make_interaction_record()
+    r2 = make_dosage_record()
+    client = FakeLLMClient()
+    client.queue = [
+        LLMError("empty", "LLM 返回空响应"),
+        {"records": [{"record_id": r1.record_id, "verdict": "SUPPORTED"}]},
+        {"records": [{"record_id": r2.record_id, "verdict": "PARTIAL"}]},
+    ]
+    report = asyncio.run(
+        verify_records(
+            records=[r1, r2],
+            blocks_path=blocks_path,
+            client=client,
+        )
+    )
+    assert client.calls == 3  # 整批失败一次 + 两个子批
+    assert report.verdict_counts() == {"SUPPORTED": 1, "PARTIAL": 1}
+
+
+def test_verify_budget_exhausted_single_record_raises(tmp_path: Path) -> None:
+    """单条记录仍撞预算：照旧失败，不无限拆批。"""
+    blocks_path = _write_blocks(tmp_path)
+    r1 = make_interaction_record()
+    client = FakeLLMClient()
+    client.queue = [LLMError("empty", "LLM 返回空响应")]
+    with pytest.raises(VerificationError):
+        asyncio.run(
+            verify_records(
+                records=[r1],
+                blocks_path=blocks_path,
+                client=client,
+            )
+        )
+    assert client.calls == 1

@@ -40,3 +40,12 @@
 ## 待抽取文本
 
 {{chunk_json}}
+
+<!-- GEPA:PROMOTED:START -->
+## 进化约束（GEPA 晋升 · 20260929T014037Z_b40a9f · web-user）
+## 进化优化约束（第 2 代）
+1. 抽取 DOSAGE 记录时，必须同时输出 dose 载荷；若原文未明确剂量数值，不得生成该记录。
+2. 抽取 INTERACTION 记录时，必须同时输出 interaction 载荷；若原文未明确相互作用内容，不得生成该记录。
+3. 特殊人群规则必须包含目标药物；若原文未指明具体药物，不得生成该记录。
+4. anchor 不得同时出现在 members 中；若出现此冲突，应调整 members 或改用其他 anchor。
+<!-- GEPA:PROMOTED:END -->

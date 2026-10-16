@@ -1,15 +1,29 @@
-# ══════════════════════════════════════════════════════════════
-# 密钥与本地配置（绝不入库）
-# ══════════════════════════════════════════════════════════════
+# Secrets and local credentials
 .env
 .env.*
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+.aws/
+.ssh/
+.netrc
+.pypirc
 
-# ══════════════════════════════════════════════════════════════
-# Python 虚拟环境与缓存
-# ══════════════════════════════════════════════════════════════
+# Local AI / editor settings and personal files
+.agents/
+.codex/
+.qoder/
+.claude/
+.cursor/
+.vscode/
+.idea/
+/resume/
+.DS_Store
+Thumbs.db
+
+# Python environments, build output and caches
 .venv/
 venv/
 env/
@@ -23,31 +37,27 @@ dist/
 .ruff_cache/
 .mypy_cache/
 .pyright/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
-# ══════════════════════════════════════════════════════════════
-# 日志与运行时状态
-# ══════════════════════════════════════════════════════════════
+# Runtime artifacts, source documents, private evaluation data
+/workspace/
+/evaluation/
+/测试数据/
 logs/
 *.log
 *.pgid
+*.pid
+*.bak
+*.pdf
+*.xlsx
+*.xls
+*.docx
+__parsed__/
 
-# ══════════════════════════════════════════════════════════════
-# workspace：忽略所有运行时产物，只保留样例书（637bb343ae75）
-#   - 真实书籍 PDF / 抽取结果 / 审核 xlsx / GEPA 运行数据一律不入库
-# ══════════════════════════════════════════════════════════════
-workspace/*
-!workspace/样例手册.md
-!workspace/books/
-workspace/books/*
-!workspace/books/637bb343ae75/
-!workspace/uploads/
-workspace/uploads/*
-!workspace/uploads/.gitkeep
-
-# ══════════════════════════════════════════════════════════════
-# 编辑器 / 操作系统
-# ══════════════════════════════════════════════════════════════
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+# Local experiments tied to private books / machine paths
+/scripts/_smoke_vision.py
+/scripts/run_reference_books.py
+/scripts/prepare_reference_evaluation.py

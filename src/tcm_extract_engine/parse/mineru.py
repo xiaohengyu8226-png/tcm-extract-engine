@@ -25,7 +25,7 @@ DEFAULT_MINERU_IMAGE_ANALYSIS = True
 DEFAULT_MINERU_HYBRID_EFFORT = "medium"
 # None 表示不干预，让 MinerU 自己取默认值（它按显存大小给 0.5 或 0.7）
 DEFAULT_MINERU_VLM_GPU_MEMORY_UTILIZATION: float | None = None
-BLOCKS_BUILDER_VERSION = "2026-09-08.preserve-layout-content-v2"
+BLOCKS_BUILDER_VERSION = "2026-10-12.heading-inherit-v3"
 
 
 # ── 公开数据模型 ─────────────────────────────────────────────────────────────
@@ -43,6 +43,11 @@ class ParseResult:
     blocks_path: Path
     #: MinerU 原始 content_list 落盘路径；表格直通通路需要它才能拿到表体 HTML 与页坐标
     content_list_path: Path | None = None
+    #: 实际产出本批内容的 backend。请求 hybrid 却静默降级成 pipeline 时，两者不同，
+    #: 缓存身份必须按这个值判定，否则降级产物会被当成 hybrid 永久缓存下来。
+    mineru_backend_used: str | None = None
+    #: True 表示请求的 backend 失败、内容由降级 backend 产出。
+    mineru_degraded: bool = False
 
     def load_content_list(self) -> list[dict[str, Any]]:
         """读取本产物对应的 content_list；Markdown 直转没有该文件时返回空。"""
@@ -147,49 +152,21 @@ def _positions_for_item(item: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def _looks_like_prescription_line(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text)
-    if not compact:
-        return False
-    if re.fullmatch(r"\d+(?:\.\d+)?(?:克|g|mg|毫克|钱|两)", compact, re.IGNORECASE):
-        return True
-    dose_matches = re.findall(r"\d+(?:\.\d+)?\s*(?:克|g|mg|毫克|钱|两)", text, re.IGNORECASE)
-    if len(dose_matches) >= 1 and re.search(r"[\u4e00-\u9fff]{1,8}\s*\d", text):
-        return True
-    if compact.startswith(("克", "钱", "两")) and re.search(r"\d", compact):
-        return True
-    return False
-
-
-def _looks_like_heading_text(text: str) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    if _looks_like_prescription_line(text):
-        return False
-    if len(text) <= 3:
-        return True
-    if re.match(r"^\d+[.．、]\s*[\u4e00-\u9fff].{0,20}(?:证|案|痛|炎|病|治|法|证候)?$", text):
-        return True
-    if re.match(r"^[一二三四五六七八九十]+[、.．]\s*[\u4e00-\u9fff].{0,24}$", text):
-        return True
-    if len(text) <= 24 and not re.search(r"[，,。；;：:]", text):
-        return True
-    return False
-
-
 def _heading_level(item: dict[str, Any]) -> int:
+    """信任解析器标注的标题层级，不再做任何书域特化的文本启发式。
+
+    解析器（MinerU 各 backend）的 text_level 只有 1/2 两档、且偶有误报；
+    真实的章/节/条层级与误报剔除由 pipeline 的 C-LLM 大纲修复
+    （cab/outline.repair_blocks）统一完成，那里按语义而非硬规则判断，
+    换书不失效。
+    """
     raw_level = item.get("text_level")
-    if raw_level is not None:
-        if not _looks_like_heading_text(str(item.get("text") or "")):
-            return 0
-        try:
-            return max(0, int(raw_level))
-        except (TypeError, ValueError):
-            return 0
-    if item.get("type") == "header":
-        return 1
-    return 0
+    if raw_level is None:
+        return 0
+    try:
+        return max(0, int(raw_level))
+    except (TypeError, ValueError):
+        return 0
 
 
 def asset_id(prefix: str, source_pdf: Path, item: dict[str, Any], index: int) -> str:
@@ -208,6 +185,29 @@ def asset_id(prefix: str, source_pdf: Path, item: dict[str, Any], index: int) ->
 def _content_list_path(raw_dir: Path) -> Path | None:
     path = raw_dir / "content_list.json"
     return path if path.is_file() else None
+
+
+def _find_asset_base(raw_dir: Path) -> Path | None:
+    """定位 img_path 的解析基准目录：含 images/ 子目录的那层（MinerU 的 auto 目录）。
+
+    content_list.json 可能被拷到 variant 根，而 img_path（如 "images/xxx.jpg"）
+    是相对 .md 所在的 auto 目录；故取 images/ 的父目录作为基准。
+    """
+    if not raw_dir.is_dir():
+        return None
+    for images_dir in sorted(raw_dir.glob("**/images")):
+        if images_dir.is_dir():
+            return images_dir.parent
+    return None
+
+
+def _resolve_asset_path(asset_base: Path | None, rel: str) -> str:
+    """把相对 img_path 解析为存在的绝对路径；解析不到返回空串（不存无效路径）。"""
+    rel = (rel or "").strip()
+    if not rel or asset_base is None:
+        return ""
+    candidate = asset_base / rel
+    return str(candidate.resolve()) if candidate.is_file() else ""
 
 
 def _content_text_for_item(
@@ -239,20 +239,24 @@ def _content_text_for_item(
         if payload:
             label = "图片解析" if item_type == "image" else "图表解析"
             content = f"{content}\n[{label}] {payload}"
-        return content, item_type, True
+        # 多模态块不带标题：heading 由所属章节上下文继承（见 _content_list_to_blocks），
+        # 避免图注/正文残留被当成标题污染 heading_path
+        return content, "", True
 
     if item_type == "table":
         table_body = item.get("table_data") or item.get("table_body") or text
         payload = str(table_body or "").strip()
         asset = asset_id("tb", source_pdf, item, index)
         content = f'<drawing id="tb-{asset}">{payload or "table"}</drawing>'
-        return content, text or payload or "table", True
+        # 多模态块不带标题：heading 由所属章节上下文继承（见 _content_list_to_blocks），
+        # 避免整段表格 HTML 被当成标题污染 heading_path/section_path
+        return content, "", True
 
     if item_type == "equation":
         equation = str(item.get("latex") or item.get("equation") or text).strip()
         asset = asset_id("eq", source_pdf, item, index)
         content = f'<drawing id="eq-{asset}">{equation or "equation"}</drawing>'
-        return content, text or equation or "equation", True
+        return content, "", True
 
     if item_type == "list":
         # MinerU 3 将有序/无序列表放在 ``list_items``，而不是 ``text``。
@@ -278,7 +282,8 @@ def _content_text_for_item(
 
 
 def _content_list_to_blocks(
-    source_pdf: Path, content_list: list[dict[str, Any]]
+    source_pdf: Path, content_list: list[dict[str, Any]],
+    *, asset_base: Path | None = None,
 ) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     heading_stack: list[str] = []
@@ -342,6 +347,7 @@ def _content_list_to_blocks(
 
     def append_multimodal_block(
         content: str, heading: str, level: int, positions: list[dict[str, Any]],
+        asset_path: str = "",
     ) -> None:
         block_id_basis = "|".join([
             source_pdf.name, heading, content, json.dumps(positions, ensure_ascii=False),
@@ -350,8 +356,11 @@ def _content_list_to_blocks(
         blocks.append({
             "type": "content", "blockid": block_id, "format": "drawing",
             "content": content, "heading": heading,
-            "parent_headings": list(heading_stack), "level": level,
+            # 正文块语义：父级 = 栈[:-1]（栈顶即 heading 自身），
+            # 保证 profiler 的章节键 = 完整标题路径，不产生幽灵章节
+            "parent_headings": list(heading_stack[:-1]), "level": level,
             "session_type": "body", "table_slice": "none", "positions": positions,
+            "asset_path": asset_path,
         })
 
     case_start = re.compile(r"^\s*(?:【病例\s*\d+】|病例\s*\d+[：:、.．]?)")
@@ -379,7 +388,16 @@ def _content_list_to_blocks(
 
         if item_type in {"image", "chart", "table", "equation"}:
             flush_current()
-            append_multimodal_block(content, heading, level, positions)
+            asset_path = _resolve_asset_path(
+                asset_base,
+                str(item.get("img_path") or item.get("table_img_path") or ""),
+            )
+            # 多模态块不开启新章节：继承当前标题栈（heading=栈顶），
+            # 不再把表体 HTML/图注等自身负载当标题（污染根源在源头消除）
+            append_multimodal_block(
+                content, heading=heading_stack[-1] if heading_stack else "",
+                level=0, positions=positions, asset_path=asset_path,
+            )
             continue
         if level > 0:
             flush_current()
@@ -501,10 +519,12 @@ def _meta_for_content_list(
 
 
 def _write_blocks_from_content_list(
-    *, source_pdf: Path, parsed_dir: Path, source_hash: str,
+    *, source_pdf: Path, parsed_dir: Path, raw_dir: Path, source_hash: str,
     doc_id: str, content_list: list[dict[str, Any]],
 ) -> tuple[Path, list[dict[str, Any]]]:
-    blocks = _content_list_to_blocks(source_pdf, content_list)
+    blocks = _content_list_to_blocks(
+        source_pdf, content_list, asset_base=_find_asset_base(raw_dir)
+    )
     meta = _meta_for_content_list(
         source_pdf=source_pdf, source_hash=source_hash,
         doc_id=doc_id, content_list=content_list, blocks=blocks,
@@ -574,6 +594,35 @@ def _mineru_cache_variant(parse_options: dict[str, Any]) -> str:
     digest = hashlib.sha256(canonical_options.encode("utf-8")).hexdigest()[:12]
     backend = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(parse_options["backend"])).strip("-")
     return f"{backend or 'mineru'}-{digest}"
+
+
+def _manifest_backend_used(manifest: dict[str, Any]) -> str:
+    """返回缓存产物**实际**由哪个 backend 产出；历史 manifest 无该字段时退回请求值。
+
+    ``MINERU_FALLBACK_TO_PIPELINE`` 打开时，一次 hybrid 失败会静默变成 pipeline 结果，
+    而旧版 manifest 只记 ``mineru_parse_options``（请求值），于是 hybrid 目录里躺着
+    pipeline 产物、且声称自己是 hybrid。E0 实测两个 backend 的产物并不等价（同 13 页：
+    标注标题 45 vs 48、list 归并块 0 vs 16，``【辨证禁忌】`` 仅 hybrid 检出），
+    所以这个误标有实际后果。老缓存按"请求即实际"处理，避免一次性把已有书全部作废。
+    """
+    used = str(manifest.get("mineru_backend_used") or "").strip()
+    if used:
+        return used
+    options = manifest.get("mineru_parse_options")
+    if isinstance(options, dict):
+        return str(options.get("backend") or "").strip()
+    return ""
+
+
+def _backend_cache_usable(manifest: dict[str, Any], *, requested_backend: str) -> bool:
+    """缓存只有在"实际 backend == 本次请求 backend"时才算命中。
+
+    不匹配时判为未命中、强制重新解析：这样 hybrid 恢复可用后能自愈，也保证降级结果
+    不会被冒充成 hybrid 缓存。副作用是 hybrid 持续失败的书每次都会重试解析——想停止
+    付费请显式把 ``MINERU_BACKEND`` 设为 pipeline，或关掉 ``MINERU_FALLBACK_TO_PIPELINE``。
+    """
+    used = _manifest_backend_used(manifest)
+    return not used or used == requested_backend
 
 
 # ── 公开入口 ─────────────────────────────────────────────────────────────────
@@ -670,17 +719,19 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
 
     parse_options = _mineru_parse_options()
     cache_variant = _mineru_cache_variant(parse_options)
+    requested_backend = str(parse_options["backend"])
     raw_dir, parsed_dir = _artifact_roots(source_pdf, cache_variant=cache_variant)
     blocks_path = _blocks_path(parsed_dir, source_pdf)
     source_hash = _sha256_file(source_pdf)
     doc_id = _doc_id(source_pdf)
 
-    # 缓存命中：manifest + blocks 均存在且版本匹配
+    # 缓存命中：manifest + blocks 均存在且版本匹配，且实际 backend 就是本次请求的 backend
     manifest = _load_manifest(raw_dir)
     if (
         manifest
         and manifest.get("source_sha256") == source_hash
         and manifest.get("mineru_parse_options") == parse_options
+        and _backend_cache_usable(manifest, requested_backend=requested_backend)
         and blocks_path.is_file()
         and _blocks_builder_version(blocks_path) == BLOCKS_BUILDER_VERSION
     ):
@@ -690,20 +741,28 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
             block_count=_count_blocks(blocks_path),
             source_pdf=source_pdf, raw_dir=raw_dir, blocks_path=blocks_path,
             content_list_path=_content_list_path(raw_dir),
+            mineru_backend_used=_manifest_backend_used(manifest) or requested_backend,
         )
 
-    # 半缓存：content_list 存在，仅需重建 blocks
+    if manifest and not _backend_cache_usable(manifest, requested_backend=requested_backend):
+        logger.warning(
+            "[MinerU] 缓存由 backend=%s 产出、本次请求 backend=%s，判为未命中并重新解析: %s",
+            _manifest_backend_used(manifest), requested_backend, source_pdf.name,
+        )
+
+    # 半缓存：content_list 存在，仅需重建 blocks（同样按实际 backend 判定，别复用降级产物）
     content_list_path = raw_dir / "content_list.json"
     if (
         manifest
         and manifest.get("source_sha256") == source_hash
         and manifest.get("mineru_parse_options") == parse_options
+        and _backend_cache_usable(manifest, requested_backend=requested_backend)
         and content_list_path.is_file()
     ):
         logger.info("[MinerU] 半缓存命中，重建 blocks: %s", source_pdf.name)
         content_list = json.loads(content_list_path.read_text(encoding="utf-8"))
         blocks_path, blocks = _write_blocks_from_content_list(
-            source_pdf=source_pdf, parsed_dir=parsed_dir,
+            source_pdf=source_pdf, parsed_dir=parsed_dir, raw_dir=raw_dir,
             source_hash=source_hash, doc_id=doc_id, content_list=content_list,
         )
         manifest["blocks_builder_version"] = BLOCKS_BUILDER_VERSION
@@ -714,6 +773,8 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
             parsed_dir=parsed_dir, cache_hit=True, block_count=len(blocks),
             source_pdf=source_pdf, raw_dir=raw_dir, blocks_path=blocks_path,
             content_list_path=content_list_path,
+            mineru_backend_used=_manifest_backend_used(manifest) or requested_backend,
+            mineru_degraded=_manifest_backend_used(manifest) != requested_backend,
         )
 
     # 全量解析
@@ -740,6 +801,7 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
 
     last_exc: Exception | None = None
     content_list: list[dict[str, Any]] = []
+    backend_used = primary_backend
 
     async def _try_parse_with_backend(backend: str) -> list[dict[str, Any]] | None:
         """尝试用指定 backend 解析，失败返回 None。"""
@@ -773,12 +835,15 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
 
     for backend in [primary_backend] + fallback_backends:
         logger.info("[MinerU] 尝试 backend: %s", backend)
-        content_list = await _try_parse_with_backend(backend)
-        if content_list:
+        parsed = await _try_parse_with_backend(backend)
+        if parsed:
+            content_list = parsed
+            backend_used = backend
             if backend != primary_backend:
-                logger.info(
-                    "[MinerU] %s 解析失败，已降级到 %s 成功",
-                    primary_backend, backend,
+                logger.warning(
+                    "[MinerU] %s 解析失败，已降级到 %s 成功；产物按**实际** backend 记账，"
+                    "下次仍请求 %s 时会判为未命中重新解析，不会把降级结果当 %s 缓存下来",
+                    primary_backend, backend, primary_backend, primary_backend,
                 )
             break
         logger.warning("[MinerU] %s 解析失败，准备尝试 fallback backend", backend)
@@ -788,7 +853,7 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
         raise RuntimeError(f"MinerU 解析失败: {source_pdf.name}")
 
     blocks_path, blocks = _write_blocks_from_content_list(
-        source_pdf=source_pdf, parsed_dir=parsed_dir,
+        source_pdf=source_pdf, parsed_dir=parsed_dir, raw_dir=raw_dir,
         source_hash=source_hash, doc_id=doc_id, content_list=content_list,
     )
 
@@ -802,6 +867,10 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
         "source_pdf": str(source_pdf),
         "source_sha256": source_hash,
         "mineru_parse_options": parse_options,
+        # 记账用：请求值在 mineru_parse_options.backend，这里只记实际产出者与耗时
+        "mineru_backend_used": backend_used,
+        "mineru_degraded": backend_used != primary_backend,
+        "mineru_parse_seconds": round(elapsed, 1),
         "cache_variant": cache_variant,
         "blocks_builder_version": BLOCKS_BUILDER_VERSION,
         "doc_id": doc_id,
@@ -823,6 +892,8 @@ async def ensure_mineru_artifact(source_pdf: Path) -> ParseResult:
         parsed_dir=parsed_dir, cache_hit=False, block_count=len(blocks),
         source_pdf=source_pdf, raw_dir=raw_dir, blocks_path=blocks_path,
         content_list_path=content_list_path,
+        mineru_backend_used=backend_used,
+        mineru_degraded=backend_used != primary_backend,
     )
 
 
@@ -909,7 +980,7 @@ async def ensure_markdown_artifact(source: Path) -> ParseResult:
     md_text = source.read_text(encoding="utf-8")
     content_list = _markdown_to_content_list(md_text)
     blocks_path, blocks = _write_blocks_from_content_list(
-        source_pdf=source, parsed_dir=parsed_dir,
+        source_pdf=source, parsed_dir=parsed_dir, raw_dir=raw_dir,
         source_hash=source_hash, doc_id=doc_id, content_list=content_list,
     )
 

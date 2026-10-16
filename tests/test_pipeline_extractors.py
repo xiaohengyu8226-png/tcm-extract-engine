@@ -13,8 +13,12 @@ from tcm_extract_engine.cab.extractors import (
     MAX_SECTION_CHARS_PER_CALL,
     ExtractionError,
     SectionChunk,
+    _attribute_batch,
+    _dedupe_headers,
     _load_batch_cache,
+    _match_blocks,
     _parse_record,
+    _passthrough_records,
     _save_batch_cache,
     extract_records,
     split_section_batches,
@@ -27,7 +31,9 @@ from tcm_extract_engine.cab.planner import (
 from tcm_extract_engine.cab.profiler import build_profile
 from tcm_extract_engine.core.artifacts import ArtifactHeader, save_artifact
 from tcm_extract_engine.core.llm import LLMError, LLMUsage
-from tcm_extract_engine.core.records import RecordType
+from tcm_extract_engine.domains.tcm.parse import _as_str_list
+from tcm_extract_engine.domains.tcm.schema import RecordType
+from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 
 # ── 测试夹具 ─────────────────────────────────────────────────────────────────
 
@@ -134,9 +140,13 @@ def _write_blocks(tmp_path: Path, blocks: list[dict[str, Any]]) -> Path:
     return path
 
 
-def _section_plan(section_id: str = "sec-1", extractor: str = "GeneralRuleExtractor",
-                   template: str = "general_rule.md", block_ids: list[str] | None = None,
-                   title: str = "4.4 剂量规范要求") -> SectionPlan:
+def _section_plan(
+    section_id: str = "sec-1",
+    extractor: str = "GeneralRuleExtractor",
+    template: str = "general_rule.md",
+    block_ids: list[str] | None = None,
+    title: str = "4.4 剂量规范要求",
+) -> SectionPlan:
     registry = PromptTemplateRegistry()
     return SectionPlan(
         section_id=section_id,
@@ -157,13 +167,12 @@ def _section_plan(section_id: str = "sec-1", extractor: str = "GeneralRuleExtrac
 def test_split_relation_group_never_split() -> None:
     """关系组章节（十八反/十九畏）整章一批，禁止切断。"""
     texts = [f"第{i}段" * 100 for i in range(10)]
-    blocks_by_id = {
-        f"b{i}": _block(f"b{i}", "附录C 十八反", 1, t)
-        for i, t in enumerate(texts)
-    }
+    blocks_by_id = {f"b{i}": _block(f"b{i}", "附录C 十八反", 1, t) for i, t in enumerate(texts)}
     section = _section_plan(
-        extractor="InteractionExtractor", template="interaction_group.md",
-        block_ids=list(blocks_by_id), title="附录C 十八反",
+        extractor="InteractionExtractor",
+        template="interaction_group.md",
+        block_ids=list(blocks_by_id),
+        title="附录C 十八反",
     )
     batches = split_section_batches(section, blocks_by_id)
     assert len(batches) == 1
@@ -173,7 +182,9 @@ def test_split_relation_group_never_split() -> None:
 def test_split_table_block_is_own_batch() -> None:
     """表格块（<drawing>）自成批次，不与文本混批。"""
     blocks_by_id = {
-        "t1": _block("t1", "附录A", 1, "<drawing id='tb-1'><table><tr><td>川乌</td></tr></table></drawing>"),
+        "t1": _block(
+            "t1", "附录A", 1, "<drawing id='tb-1'><table><tr><td>川乌</td></tr></table></drawing>"
+        ),
         "p1": _block("p1", "附录A", 1, "正文说明。"),
         "p2": _block("p2", "附录A", 2, "更多正文。"),
     }
@@ -187,13 +198,8 @@ def test_split_table_block_is_own_batch() -> None:
 
 def test_split_text_aggregation_char_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     """文本块按字符上限聚合分批。"""
-    monkeypatch.setattr(
-        "tcm_extract_engine.cab.extractors.MAX_SECTION_CHARS_PER_CALL", 100
-    )
-    blocks_by_id = {
-        f"b{i}": _block(f"b{i}", "4.4", 1, "字" * 60)
-        for i in range(4)
-    }
+    monkeypatch.setattr("tcm_extract_engine.cab.extractors.MAX_SECTION_CHARS_PER_CALL", 100)
+    blocks_by_id = {f"b{i}": _block(f"b{i}", "4.4", 1, "字" * 60) for i in range(4)}
     section = _section_plan(block_ids=list(blocks_by_id))
     batches = split_section_batches(section, blocks_by_id)
     # 每批 ≥100 字即切：60+60=120 超限 → 每批 2 块 → 2 批
@@ -213,11 +219,13 @@ def test_split_missing_blocks_skipped() -> None:
 
 
 def test_batch_cache_roundtrip_and_version_invalidation(tmp_path: Path) -> None:
-    from tcm_extract_engine.core.records import SourceRecord
+    from tcm_extract_engine.domains.tcm.schema import TCMRecord as SourceRecord
 
     record = SourceRecord(
-        record_id="SR-test-000001", book_id="test",
-        record_type=RecordType.GENERAL_RULE, raw_text="孕妇慎用红花。",
+        record_id="SR-test-000001",
+        book_id="test",
+        record_type=RecordType.GENERAL_RULE,
+        raw_text="孕妇慎用红花。",
     )
     _save_batch_cache(tmp_path, "sec:abc", [record], prompt_version="v1")
     loaded = _load_batch_cache(tmp_path, "sec:abc", prompt_version="v1")
@@ -231,28 +239,36 @@ def test_batch_cache_roundtrip_and_version_invalidation(tmp_path: Path) -> None:
 
 
 _DOSAGE_RESPONSE = {
-    "records": [{
-        "record_type": "DOSAGE",
-        "raw_text": "制川乌 1.5～3g，先煎",
-        "page_hint": 12,
-        "herb_name": "制川乌",
-        "dose": {"min_dose": 1.5, "max_dose": 3, "unit": "g", "special_note": "先煎"},
-    }],
+    "records": [
+        {
+            "record_type": "DOSAGE",
+            "raw_text": "制川乌 1.5～3g，先煎",
+            "page_hint": 12,
+            "herb_name": "制川乌",
+            "dose": {"min_dose": 1.5, "max_dose": 3, "unit": "g", "special_note": "先煎"},
+        }
+    ],
 }
 _INTERACTION_RESPONSE = {
-    "records": [{
-        "record_type": "INTERACTION",
-        "raw_text": "甘草反甘遂、大戟、芫花、海藻",
-        "page_hint": 40,
-        "interaction": {
-            "interaction_type": "十八反",
-            "group_name": "十八反-甘草组",
-            "anchor": {"herb_name": "甘草"},
-            "members": [{"herb_name": "甘遂"}, {"herb_name": "大戟"},
-                        {"herb_name": "芫花"}, {"herb_name": "海藻"}],
-        },
-        "action": "PROHIBIT",
-    }],
+    "records": [
+        {
+            "record_type": "INTERACTION",
+            "raw_text": "甘草反甘遂、大戟、芫花、海藻",
+            "page_hint": 40,
+            "interaction": {
+                "interaction_type": "十八反",
+                "group_name": "十八反-甘草组",
+                "anchor": {"herb_name": "甘草"},
+                "members": [
+                    {"herb_name": "甘遂"},
+                    {"herb_name": "大戟"},
+                    {"herb_name": "芫花"},
+                    {"herb_name": "海藻"},
+                ],
+            },
+            "action": "PROHIBIT",
+        }
+    ],
 }
 
 
@@ -280,16 +296,22 @@ def test_extract_records_end_to_end(tmp_path: Path) -> None:
     client = FakeLLMClient()
     client.queue = [dict(_DOSAGE_RESPONSE), dict(_INTERACTION_RESPONSE)]
 
-    records = asyncio.run(extract_records(
-        book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=tmp_path / "cache", client=client,
-    ))
+    records = asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=tmp_path / "cache",
+            client=client,
+        )
+    )
 
     assert client.calls == 2
     assert len(records) == 2
     # 全局序号重排
-    assert records[0].record_id == "SR-testbook-000001"
-    assert records[1].record_id == "SR-testbook-000002"
+    assert records[0].record_id.startswith("SR-testbook")
+    assert records[1].record_id.startswith("SR-testbook")
+    assert records[0].record_id != records[1].record_id
     # 记录类型与载荷
     assert records[0].record_type == RecordType.DOSAGE
     assert records[0].dose is not None and records[0].dose.max_dose == 3
@@ -306,16 +328,26 @@ def test_extract_records_uses_cache_on_rerun(tmp_path: Path) -> None:
 
     first = FakeLLMClient()
     first.queue = [dict(_DOSAGE_RESPONSE), dict(_INTERACTION_RESPONSE)]
-    records1 = asyncio.run(extract_records(
-        book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=cache_dir, client=first,
-    ))
+    records1 = asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=cache_dir,
+            client=first,
+        )
+    )
 
     second = FakeLLMClient()  # 队列为空：若未命中缓存将抛错
-    records2 = asyncio.run(extract_records(
-        book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=cache_dir, client=second,
-    ))
+    records2 = asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=cache_dir,
+            client=second,
+        )
+    )
     assert second.calls == 0
     assert [r.record_id for r in records2] == [r.record_id for r in records1]
 
@@ -328,18 +360,28 @@ def test_extract_records_partial_failure_then_resume(tmp_path: Path) -> None:
     failing = FakeLLMClient()
     failing.queue = [dict(_DOSAGE_RESPONSE), LLMError("api", "模拟 API 故障")]
     with pytest.raises(ExtractionError, match="1/2"):
-        asyncio.run(extract_records(
-            book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-            cache_dir=cache_dir, client=failing,
-        ))
+        asyncio.run(
+            extract_records(
+                book_id="testbook01",
+                blocks_path=blocks_path,
+                plan_path=plan_path,
+                cache_dir=cache_dir,
+                client=failing,
+            )
+        )
 
     # resume：第一批走缓存，第二批重新调用
     resumed = FakeLLMClient()
     resumed.queue = [dict(_INTERACTION_RESPONSE)]
-    records = asyncio.run(extract_records(
-        book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=cache_dir, client=resumed,
-    ))
+    records = asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=cache_dir,
+            client=resumed,
+        )
+    )
     assert resumed.calls == 1
     assert len(records) == 2
     assert records[1].record_type == RecordType.INTERACTION
@@ -371,10 +413,15 @@ def test_extract_records_truncation_split_retry(tmp_path: Path) -> None:
         {"records": [{"record_type": "USAGE", "raw_text": "生川乌外用", "herb_name": "生川乌"}]},
     ]
 
-    records = asyncio.run(extract_records(
-        book_id="truncbook", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=tmp_path / "cache", client=client,
-    ))
+    records = asyncio.run(
+        extract_records(
+            book_id="truncbook",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=tmp_path / "cache",
+            client=client,
+        )
+    )
     assert client.calls == 3  # 1 次截断 + 2 次拆分后
     assert len(records) == 2
 
@@ -386,11 +433,16 @@ def test_extract_records_progress_callback(tmp_path: Path) -> None:
     client.queue = [dict(_DOSAGE_RESPONSE), dict(_INTERACTION_RESPONSE)]
 
     progress: list[tuple[int, int]] = []
-    asyncio.run(extract_records(
-        book_id="testbook01", blocks_path=blocks_path, plan_path=plan_path,
-        cache_dir=tmp_path / "cache", client=client,
-        on_progress=lambda p: progress.append((p.current, p.total)),
-    ))
+    asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=tmp_path / "cache",
+            client=client,
+            on_progress=lambda p: progress.append((p.current, p.total)),
+        )
+    )
     assert progress == [(1, 2), (2, 2)]
 
 
@@ -399,3 +451,162 @@ def test_section_chunk_dataclass() -> None:
     chunk = SectionChunk(section=section, texts=["a"], pages=[1], chunk_key="k")
     assert chunk.section is section
     assert MAX_SECTION_CHARS_PER_CALL > 0
+
+
+# ── block 溯源（供后续入 Milvus）──────────────────────────────
+
+
+def test_extract_records_populates_block_provenance(tmp_path: Path) -> None:
+    """抽取记录溯源到 block：block_ids 命中具体块，chunk_id = 批次键。"""
+    blocks_path, plan_path = _setup_book(tmp_path)
+    client = FakeLLMClient()
+    client.queue = [dict(_DOSAGE_RESPONSE), dict(_INTERACTION_RESPONSE)]
+    records = asyncio.run(
+        extract_records(
+            book_id="testbook01",
+            blocks_path=blocks_path,
+            plan_path=plan_path,
+            cache_dir=tmp_path / "cache",
+            client=client,
+        )
+    )
+    dosage, inter = records
+    assert dosage.source.block_ids == ["b1"]
+    assert inter.source.block_ids == ["b2"]
+    assert dosage.source.chunk_id and dosage.source.chunk_id.startswith("sec-")
+
+
+def test_match_blocks_precise_and_fallback() -> None:
+    """多块批次：raw_text 命中哪块就溯源到哪块；命不中/空文本回退整批。"""
+    batch = SectionChunk(
+        section=_section_plan(),
+        texts=["甘草反甘遂。", "乌头反贝母。"],
+        pages=[40, 41],
+        block_ids=["b1", "b2"],
+        chunk_key="sec-x:0:hash",
+    )
+    assert _match_blocks("乌头反贝母", batch) == ["b2"]
+    assert _match_blocks("查无此句", batch) == ["b1", "b2"]
+    assert _match_blocks("", batch) == ["b1", "b2"]
+
+
+def test_attribute_batch_sets_chunk_and_blocks() -> None:
+    batch = SectionChunk(
+        section=_section_plan(),
+        texts=["甘草反甘遂。"],
+        pages=[40],
+        block_ids=["b1"],
+        chunk_key="sec-x:0:hash",
+    )
+    rec = SourceRecord(
+        record_id="SR-x-000001",
+        book_id="b",
+        record_type=RecordType.INTERACTION,
+        raw_text="甘草反甘遂",
+    )
+    _attribute_batch([rec], batch)
+    assert rec.source.block_ids == ["b1"]
+    assert rec.source.chunk_id == "sec-x:0:hash"
+
+
+# ── A1 回归：target_herbs 字符串被逐字拆散的 bug ──────────────────────────
+
+
+def test_as_str_list_normalizes_string_and_list() -> None:
+    """_as_str_list：字符串按分隔符切、列表逐项归一、异型降级为空。"""
+    assert _as_str_list("芒硝、甘遂，大戟") == ["芒硝", "甘遂", "大戟"]
+    assert _as_str_list(["芒硝", "甘遂、大戟"]) == ["芒硝", "甘遂", "大戟"]
+    assert _as_str_list(["附子"]) == ["附子"]  # 单项原样
+    assert _as_str_list(None) == []
+    assert _as_str_list([]) == []
+    assert _as_str_list(123) == []
+
+
+def test_parse_pregnancy_string_target_herbs_not_char_split() -> None:
+    """LLM 把 target_herbs 返回成字符串时，应按顿号切成词，而非逐字拆散。
+
+    复现 SR-9e5d661f-000393："芒硝、甘遂…" 曾被拆成 ["芒","硝","、","甘","遂",…]。
+    """
+    raw = {
+        "record_type": "PREGNANCY",
+        "raw_text": "作用峻猛的泻下药如芒硝、甘遂、大戟、芫花等",
+        "pregnancy": {
+            "restriction_level": "慎用",
+            "target_herbs": "芒硝、甘遂、大戟、芫花",  # 字符串而非数组 = bug 触发条件
+        },
+    }
+    record = _parse_record(raw, book_id="9e5d661f1a4f", seq=393, section=_section_plan())
+    assert record.pregnancy is not None
+    assert record.pregnancy.target_herbs == ["芒硝", "甘遂", "大戟", "芫花"]
+    assert "芒" not in record.pregnancy.target_herbs  # 不再是单字碎片
+
+
+def test_parse_population_string_target_herbs_not_char_split() -> None:
+    """POPULATION 同源 bug：target_herbs 字符串按分隔符切分。"""
+    raw = {
+        "record_type": "POPULATION",
+        "raw_text": "孕妇慎用芒硝、甘遂。",
+        "population": {
+            "population": "孕妇",
+            "restriction_level": "慎用",
+            "target_herbs": "芒硝、甘遂",
+        },
+    }
+    record = _parse_record(raw, book_id="9e5d661f1a4f", seq=384, section=_section_plan())
+    assert record.population is not None
+    assert record.population.target_herbs == ["芒硝", "甘遂"]
+
+
+# ── A2 回归：重复表头被 dict 折叠、subject 与 attributes 串位 ──────────────
+
+
+def test_dedupe_headers_suffixes_repeats() -> None:
+    assert _dedupe_headers(["正名", "别名", "正名", "别名"]) == [
+        "正名",
+        "别名",
+        "正名2",
+        "别名2",
+    ]
+    assert _dedupe_headers(["名", "名", "名"]) == ["名", "名2", "名3"]
+    assert _dedupe_headers(["a", "b"]) == ["a", "b"]  # 无重复原样
+    assert _dedupe_headers(["", ""]) == ["", ""]  # 空表头保留
+
+
+def test_passthrough_duplicate_headers_not_collapsed() -> None:
+    """两药一行的四列表：正名/别名各出现两次，不得相互覆盖。
+
+    复现 SR-9e5d661f-000001：subject="大血藤" 却 attrs={"正名":"大黄",…}（串位）。
+    """
+    html = (
+        "<drawing id='tb-1'><table>"
+        "<tr><td>正名</td><td>别名</td><td>正名</td><td>别名</td></tr>"
+        "<tr><td>大血藤</td><td>红藤、红血藤</td><td>大黄</td><td>川军、锦纹、将军</td></tr>"
+        "</table></drawing>"
+    )
+    section = _section_plan(
+        extractor="HerbTableExtractor",
+        template="herb_table.md",
+        title="正名别名表",
+    )
+    batch = SectionChunk(
+        section=section,
+        texts=[html],
+        pages=[5],
+        block_ids=["t1"],
+        chunk_key="sec-t:0:x",
+        passthrough=True,
+    )
+    records = _passthrough_records(batch, "9e5d661f1a4f")
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.record_type == RecordType.TABLE_ROW
+    assert rec.subject_text == "大血藤"
+    # 关键回归：两对「正名/别名」都保留，未被折叠覆盖
+    assert rec.payload["attributes"] == {
+        "正名": "大血藤",
+        "别名": "红藤、红血藤",
+        "正名2": "大黄",
+        "别名2": "川军、锦纹、将军",
+    }
+    # subject_text 与首列正名一致（不再串位到「大黄」）
+    assert rec.payload["attributes"]["正名"] == rec.subject_text

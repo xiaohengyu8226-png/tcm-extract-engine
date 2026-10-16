@@ -34,22 +34,32 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from tcm_extract_engine.cab.planner import PromptTemplateRegistry
-from tcm_extract_engine.cab.profiler import CONTENT_TYPE_TO_EXTRACTOR, load_blocks
+from tcm_extract_engine.cab.planner import (
+    ADAPTATION_TEMPLATE,
+    BookAdaptedRegistry,
+    PromptTemplateRegistry,
+    adaptation_version,
+)
+from tcm_extract_engine.cab.profiler import (
+    load_blocks,
+)
 from tcm_extract_engine.cab.validator import Severity
-from tcm_extract_engine.cab.verifier import CorrectionEntry
+from tcm_extract_engine.cab.verifier import CorrectionEntry, apply_correction
 from tcm_extract_engine.common.paths import project_paths
 from tcm_extract_engine.core.artifacts import (
     ArtifactHeader,
+    artifact_hash,
     load_artifact,
     load_artifact_records,
     save_artifact,
 )
-from tcm_extract_engine.core.book import BookWorkspace, list_books
+from tcm_extract_engine.core.book import ADAPTATION_FILENAME, BookWorkspace, list_books
 from tcm_extract_engine.core.manifest import BookManifest, BookStatus
 from tcm_extract_engine.core.records import SourceRecord
+from tcm_extract_engine.domains import get_domain_pack
 from tcm_extract_engine.runner import BookPipeline
 
 logger = logging.getLogger(__name__)
@@ -106,7 +116,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _pipeline.close()
 
 
-app = FastAPI(title="中医智能审方系统 · 逐步控制抽取", version="0.1.0", lifespan=_lifespan)
+app = FastAPI(title="书籍知识抽取工作台", version="0.1.0", lifespan=_lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ── 状态派生 ────────────────────────────────────────────────────────────────
@@ -166,20 +177,60 @@ def _job_view(ws_book_id: str, m: BookManifest) -> dict[str, Any]:
             issues = len(load_artifact(validate_path).get("issues", []))
         except Exception:  # noqa: BLE001 - 坏报告不阻断任务列表
             issues = 0
+    ws = BookWorkspace(BOOKS_ROOT, ws_book_id)
+    failed_stage = next(
+        (name for name, stage in reversed(list(m.stages.items())) if stage.status == "FAILED"), None
+    ) if m.status == BookStatus.FAILED else None
+    progress: dict[str, Any] = {}
+    ledger_path = ws.stage_dir("extract") / "batch_ledger.json"
+    try:
+        started = datetime.fromisoformat(extract.started_at).timestamp() if extract and extract.started_at else 0
+        if ledger_path.is_file() and ledger_path.stat().st_mtime >= started:
+            batches = json.loads(ledger_path.read_text(encoding="utf-8"))
+            progress = {
+                "total": len(batches),
+                "completed": sum(b.get("status") == "DONE" for b in batches),
+                "failed": sum(b.get("status") == "FAILED" for b in batches),
+            }
+        elif m.status in {BookStatus.EXTRACTING, BookStatus.FAILED}:
+            progress = {"cached": len(list((ws.stage_dir("extract") / "cache").glob("batch_*.json")))}
+    except (OSError, ValueError, TypeError):
+        progress = {}
+    quality = None
+    quality_path = ws.stage_dir("publish") / "knowledge" / "quality_report.json"
+    verified_path = ws.stage_artifact("verify")
+    if "verify" in m.completed_stages() and not m.derived_artifacts_stale:
+        try:
+            if quality_path.is_file() and verified_path.is_file() and quality_path.stat().st_mtime >= verified_path.stat().st_mtime:
+                report = json.loads(quality_path.read_text(encoding="utf-8"))
+                quality = {k: report.get(k) for k in ("records", "usable_records", "quarantined_records", "evidence_count")}
+        except (OSError, ValueError):
+            pass
+    message = rt.get("message") or ""
+    if m.status == BookStatus.FAILED:
+        message = m.error or message
+    elif message.startswith("步骤失败"):
+        message = ""
     return {
         "job_id": m.book_id,
         "filename": m.file_name,
         "workflow_stage": _view_stage(m),
         "status": m.status.value,
-        "message": rt.get("message") or (m.error or ""),
+        "message": message,
+        "domain_id": m.domain_id,
+        "domain_label": get_domain_pack(m.domain_id).label,
+        "failed_stage": failed_stage,
+        "batch_progress": progress,
+        "quality": quality,
         "chunks_count": parse.records if parse and parse.records is not None else 0,
         "records_count": extract.records if extract and extract.records is not None else 0,
         "verification_issues": issues,
         "prompt_confirmed": _prompt_confirmed(m),
+        "has_extract": "extract" in m.completed_stages(),
         "created_at": m.created_at,
         "updated_at": m.updated_at,
         "step_started_at": rt.get("step_started_at", 0),
-        "error": m.error,
+        "error": m.error if m.status == BookStatus.FAILED else None,
     }
 
 
@@ -263,9 +314,15 @@ async def list_jobs() -> list[dict[str, Any]]:
 async def upload(
     file: UploadFile = File(...),
     relative_path: str | None = Form(None),
+    domain: str = Form("general"),
+    auto_run: bool = Form(True),
     force: bool = Query(False),
 ) -> dict[str, Any]:
     """保存上传文件并建立书籍工作目录（幂等：同 hash 复用）。"""
+    try:
+        get_domain_pack(domain)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     if not file.filename:
         raise HTTPException(400, "请上传文件")
     suffix = Path(file.filename).suffix.lower()
@@ -285,14 +342,19 @@ async def upload(
                 raise HTTPException(413, "文件超过大小限制（512MB）")
 
     try:
-        ws = BookWorkspace.create(BOOKS_ROOT, dest)
+        ws = BookWorkspace.create(BOOKS_ROOT, dest, domain_id=domain)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
     finally:
         # 源文件已被 create() 复制进 00_source，删除临时副本
         if dest.is_file():
             dest.unlink(missing_ok=True)
 
     m = ws.load_manifest()
-    return {"job_id": m.book_id, "status": "uploaded", "filename": m.file_name}
+    if auto_run:
+        _guard_not_running(m.book_id)
+        _spawn(m.book_id, _pipe().resume(m.book_id))
+    return {"job_id": m.book_id, "status": "running" if auto_run else "uploaded", "filename": m.file_name}
 
 
 # ── 路由：步骤 1 解析 ─────────────────────────────────────────────────────────
@@ -351,9 +413,48 @@ async def step_generate_prompt(job_id: str) -> dict[str, str]:
     return {"status": "started", "stage": "generating_prompt"}
 
 
+# ── 蓝图编辑：展示标签、确定性派生与同源注册表 ───────────────────────────────
+
+
+def _pack_labels(domain_id: str = "tcm") -> dict[str, Any]:
+    """领域包声明面标签：extractor/template/content_type 中文名 + 人工跳过标记。"""
+    return get_domain_pack(domain_id).labels
+
+
+def _derive_routing(content_type: str, domain_id: str = "tcm") -> tuple[str, str]:
+    pack = get_domain_pack(domain_id)
+    extractor = pack.content_extractors.get(content_type, "")
+    return extractor, pack.extractor_templates.get(extractor, "")
+
+
+def _profile_content_types(ws: BookWorkspace) -> dict[str, str]:
+    """读章节画像：section_id → content_type（缺画像/坏文件返回空表）。"""
+    path = ws.stage_artifact("profile")
+    if not path.is_file():
+        return {}
+    try:
+        profile = load_artifact(path)
+    except Exception:  # noqa: BLE001 - 坏画像不阻断蓝图展示
+        return {}
+    return {
+        str(s.get("section_id")): str(s.get("content_type") or "")
+        for s in profile.get("sections", [])
+        if s.get("section_id")
+    }
+
+
+def _edited_registry(ws: BookWorkspace) -> PromptTemplateRegistry | BookAdaptedRegistry:
+    """与抽取阶段同源的模板注册表：有适配块则合成 hash(base+块)，否则 base。"""
+    adaptations = _load_adaptations(ws)
+    blocks = {t: a["block"] for t, a in adaptations.items() if a.get("block")}
+    if not blocks:
+        return PromptTemplateRegistry()
+    return BookAdaptedRegistry(blocks, prompts_root=PromptTemplateRegistry().prompts_root)
+
+
 @app.get("/api/jobs/{job_id}/schema")
 async def get_schema(job_id: str) -> dict[str, Any]:
-    """把抽取计划映射成前端「Schema/Sheet」视图。"""
+    """把抽取计划映射成前端「蓝图复核」视图：路由结果 + 规划器原因 + 人工覆盖状态。"""
     _manifest(job_id)
     ws = BookWorkspace(BOOKS_ROOT, job_id)
     plan_path = ws.stage_artifact("plan")
@@ -362,8 +463,58 @@ async def get_schema(job_id: str) -> dict[str, Any]:
     plan = load_artifact(plan_path)
     sections = plan.get("sections", [])
     planned = [s for s in sections if not s.get("skip_reason")]
+    profile_ct = _profile_content_types(ws)
     registry = PromptTemplateRegistry()
     templates_dir = registry.prompts_root / "a"
+    labels = _pack_labels(_manifest(job_id).domain_id)
+    extractor_labels = labels["extractor"]
+    template_labels = labels["template"]
+    content_type_labels = labels["content_type"]
+    manual_skip = labels["manual_skip"]
+    editable: list[dict[str, Any]] = []
+    for s in sections:
+        sid = s.get("section_id", "")
+        ct = profile_ct.get(sid, "")
+        ext = s.get("extractor", "")
+        tpl = s.get("template", "")
+        skip_reason = s.get("skip_reason")
+        derived = _derive_routing(ct, _manifest(job_id).domain_id) if ct else ("", "")
+        d_ext, d_tpl = derived
+        if skip_reason == manual_skip:
+            mode = "skip"  # 人工强制跳过
+        elif not ct:
+            mode = "auto"  # 无画像：维持现状，禁用恢复
+        elif not d_ext:
+            mode = "auto"  # 规划器自动跳过（仅参考/无关）
+        elif (ext, tpl) == derived and not skip_reason:
+            mode = "auto"  # 与规划器一致
+        else:
+            mode = "extract"  # 人工覆盖路由
+        editable.append(
+            {
+                "section_id": sid,
+                "title": s.get("title", ""),
+                "heading_path": s.get("heading_path") or [],
+                "page_start": s.get("page_start"),
+                "page_end": s.get("page_end"),
+                "block_count": len(s.get("block_ids") or []),
+                "content_type": ct,
+                "content_type_label": content_type_labels.get(ct, ct),
+                "extractor": ext,
+                "extractor_label": extractor_labels.get(ext, ext),
+                "template": tpl,
+                "template_label": template_labels.get(tpl, tpl),
+                "skip": bool(skip_reason),
+                "skip_reason": skip_reason,
+                "skip_kind": "manual"
+                if skip_reason == manual_skip
+                else ("auto" if skip_reason else None),
+                "mode": mode,
+                "derived": {"extractor": d_ext, "template": d_tpl, "skip": not d_ext}
+                if ct
+                else None,
+            }
+        )
     return {
         "schema": {"sections": sections},
         "domain": plan.get("goal", ""),
@@ -382,19 +533,18 @@ async def get_schema(job_id: str) -> dict[str, Any]:
             }
             for s in planned
         ],
-        # 蓝图人工编辑：可选抽取器/模板 + 全章节可编辑视图
-        "available_extractors": sorted({v for v in CONTENT_TYPE_TO_EXTRACTOR.values() if v}),
-        "available_templates": sorted(p.name for p in templates_dir.glob("*.md")),
-        "editable_sections": [
+        # 蓝图人工调整：抽取器可选集 + 中文标签 + 富化后的章节视图
+        "available_extractors": sorted(
             {
-                "section_id": s.get("section_id", ""),
-                "title": s.get("title", ""),
-                "extractor": s.get("extractor", ""),
-                "template": s.get("template", ""),
-                "skip": bool(s.get("skip_reason")),
+                v
+                for v in get_domain_pack(_manifest(job_id).domain_id).content_extractors.values()
+                if v
             }
-            for s in sections
-        ],
+        ),
+        "available_templates": sorted(p.name for p in templates_dir.glob("*.md")),
+        "extractor_labels": extractor_labels,
+        "template_labels": template_labels,
+        "editable_sections": editable,
         "qa_rules": plan.get("risk_points", []),
         "total_sections": len(sections),
         "planned_sections": len(planned),
@@ -403,11 +553,21 @@ async def get_schema(job_id: str) -> dict[str, Any]:
 
 @app.put("/api/jobs/{job_id}/schema")
 async def update_schema(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """人工编辑抽取蓝图：改章节的抽取器/模板/跳过标记，重写 plan 产物。
+    """人工调整抽取蓝图：冻结门 + 三态编辑契约。
 
-    已确认且抽过取的书：下游 extract 及之后记录作废（产物保留），需重新抽取。
+    每章节一个 {section_id, mode, extractor?}：
+      - auto    恢复规划器默认路由（由章节画像的 content_type 确定性派生）
+      - skip    人工强制跳过
+      - extract 人工强制抽取（extractor 必填；模板由 EXTRACTOR_TEMPLATES 唯一确定，杜绝错配）
+    已确认方案（PLAN_CONFIRMED 及以后）蓝图冻结，需先「解锁编辑」
+    （workflow/goto-prompt）回退到待确认状态；已抽取的书保存后作废 extract
+    及下游阶段记录（产物保留），仅变更章节需重新调用 Model A。
     """
     m = _manifest(job_id)
+    if m.status != BookStatus.WAITING_PLAN_CONFIRMATION:
+        raise HTTPException(
+            400, "蓝图已冻结（方案已确认）。请先「解锁编辑」回退到待确认状态，再调整路由。"
+        )
     ws = BookWorkspace(BOOKS_ROOT, job_id)
     plan_path = ws.stage_artifact("plan")
     if not plan_path.is_file():
@@ -415,44 +575,98 @@ async def update_schema(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
     raw = json.loads(plan_path.read_text(encoding="utf-8"))
     sections = raw.get("sections", [])
     edits = {e.get("section_id"): e for e in body.get("sections", []) if e.get("section_id")}
-    registry = PromptTemplateRegistry()
-    valid_ext = {v for v in CONTENT_TYPE_TO_EXTRACTOR.values() if v}
-    valid_tpl = {p.name for p in (registry.prompts_root / "a").glob("*.md")}
+    profile_ct = _profile_content_types(ws)
+    # 与抽取阶段同源：有适配块则 prompt_version = hash(base+块)，保证缓存键一致
+    registry = _edited_registry(ws)
+    valid_ext = {
+        v for v in get_domain_pack(_manifest(job_id).domain_id).content_extractors.values() if v
+    }
+    manual_skip = _pack_labels(m.domain_id)["manual_skip"]
     for s in sections:
-        e = edits.get(s.get("section_id"))
+        sid = s.get("section_id")
+        e = edits.get(sid)
         if not e:
             continue
-        ext = str(e.get("extractor") or "")
-        tpl = str(e.get("template") or "")
-        if ext and ext not in valid_ext:
-            raise HTTPException(400, f"未知抽取器: {ext}")
-        if tpl and tpl not in valid_tpl:
-            raise HTTPException(400, f"未知模板: {tpl}")
-        if e.get("skip"):
-            s["skip_reason"] = "人工标记不抽取"
-            s["extractor"] = ""
-            s["template"] = ""
-            s["prompt_version"] = ""
-        else:
-            if not ext or not tpl:
-                raise HTTPException(400, f"章节 {s.get('section_id')} 取消跳过后必须同时指定抽取器与模板")
+        mode = str(e.get("mode") or "")
+        if mode == "auto":
+            ct = profile_ct.get(sid, "")
+            if not ct:
+                raise HTTPException(
+                    400,
+                    f"章节 {s.get('title') or sid} 缺少章节画像，无法恢复自动路由；请重新生成蓝图",
+                )
+            ext, tpl = _derive_routing(ct, m.domain_id)
+            if ext:
+                s["extractor"], s["template"] = ext, tpl
+                s["skip_reason"] = None
+                s["prompt_version"] = registry.load("a", tpl).version
+            else:
+                s["extractor"] = s["template"] = s["prompt_version"] = ""
+                s["skip_reason"] = f"content_type={ct} 不抽取"
+        elif mode == "skip":
+            s["skip_reason"] = manual_skip
+            s["extractor"] = s["template"] = s["prompt_version"] = ""
+        elif mode == "extract":
+            ext = str(e.get("extractor") or "")
+            if ext not in valid_ext:
+                raise HTTPException(400, f"未知抽取器: {ext}")
+            tpl = get_domain_pack(m.domain_id).extractor_templates[ext]
+            s["extractor"], s["template"] = ext, tpl
             s["skip_reason"] = None
-            s["extractor"] = ext
-            s["template"] = tpl
-            s["prompt_version"] = registry.version_of("a", tpl)
+            s["prompt_version"] = registry.load("a", tpl).version
+        else:
+            raise HTTPException(400, f"未知编辑模式: {mode}")
     raw["sections"] = sections
-    raw.setdefault("header", {}).setdefault("extra", {})["plan_edited_at"] = (
-        datetime.now(timezone.utc).isoformat()
-    )
+    raw.setdefault("header", {}).setdefault("extra", {})["plan_edited_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
     plan_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-    if _prompt_confirmed(m) and "extract" in m.completed_stages():
-        _pipe().rewind(job_id, to_stage="extract")
+    # 与 update_adaptations 同一公式重算合成版本；先落盘再作废下游
+    # （invalidate_from 从磁盘重读 manifest，避免新版本被旧状态覆盖）
+    versions = sorted({s.get("prompt_version") for s in sections if s.get("prompt_version")})
+    m.prompt_version = artifact_hash({"prompt_versions": versions})[:20] if versions else None
+    m.save(ws.book_dir)
+    if "extract" in m.completed_stages():
+        _pipe().invalidate_from(job_id, "extract")
     return await get_schema(job_id)
+
+
+def _load_adaptations(ws: BookWorkspace) -> dict[str, dict[str, Any]]:
+    """读 03_plan/prompt_adaptations.json → template → 适配块字典（坏文件退回空）。"""
+    path = ws.stage_dir("plan") / ADAPTATION_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        data = load_artifact(path)
+    except Exception:  # noqa: BLE001 - 坏产物不阻断展示
+        return {}
+    raw = data.get("adaptations") or {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _profile_summary(ws: BookWorkspace) -> str:
+    """把 document_profile 压缩成供审核 C 输入的摘要文本。"""
+    path = ws.stage_artifact("profile")
+    if not path.is_file():
+        return ""
+    try:
+        profile = load_artifact(path)
+    except Exception:  # noqa: BLE001
+        return ""
+    sections = profile.get("sections", [])
+    lines = [
+        f"document_type: {profile.get('document_type', '')}",
+        f"total_blocks: {profile.get('total_blocks', 0)}",
+        f"sections: {len(sections)}",
+    ]
+    for s in sections[:40]:
+        lines.append(f"- [{s.get('content_type', '')}] {s.get('title', '')}")
+    return "\n".join(lines)
 
 
 @app.get("/api/jobs/{job_id}/prompt")
 async def get_prompt(job_id: str) -> dict[str, Any]:
-    """返回本方案选用的 A 模板正文（引擎不允许自由生成 Prompt）。"""
+    """返回本方案选用的 A 模板正文 + 每书适配块（base 逐字不变，适配块可复核）。"""
     ws = BookWorkspace(BOOKS_ROOT, job_id)
     plan_path = ws.stage_artifact("plan")
     if not plan_path.is_file():
@@ -460,17 +674,34 @@ async def get_prompt(job_id: str) -> dict[str, Any]:
     plan = load_artifact(plan_path)
     registry = PromptTemplateRegistry()
     names = sorted({s["template"] for s in plan.get("sections", []) if s.get("template")})
+    adaptations = _load_adaptations(ws)
     blocks: list[str] = []
+    adaptation_view: list[dict[str, Any]] = []
     for name in names:
         try:
-            blocks.append(f"# ── {name} ──\n" + registry.load("a", name).content)
+            base = registry.load("a", name).content
         except FileNotFoundError:
             blocks.append(f"# ── {name}（缺失）──")
+            continue
+        adapt = adaptations.get(name) or {}
+        block = str(adapt.get("block") or "")
+        composed = f"{base.rstrip()}\n\n{block}\n" if block else base
+        blocks.append(f"# ── {name} ──\n" + composed)
+        adaptation_view.append(
+            {
+                "template": name,
+                "block": block,
+                "version": adapt.get("version", ""),
+                "degraded": bool(adapt.get("degraded", False)),
+                "human_edited": bool(adapt.get("human_edited", False)),
+            }
+        )
     return {
         "prompt": "\n\n".join(blocks),
         "templates": names,
+        "adaptations": adaptation_view,
         "editable": False,
-        "note": "引擎采用固定模板库（防 Prompt Drift）；如需调整请改 prompts/a/* 或走 GEPA 晋升。",
+        "note": "base 模板逐字只读（防 Prompt Drift，全局调整走磁盘/GEPA 晋升）；每书适配块可人工编辑/重生成，保存后重算版本并作废下游抽取。",
     }
 
 
@@ -478,14 +709,24 @@ async def get_prompt(job_id: str) -> dict[str, Any]:
 async def get_meta_prompt(job_id: str) -> dict[str, Any]:
     registry = PromptTemplateRegistry()
     try:
-        planner = registry.load("c", "planner.md").content
+        planner = registry.load("c", ADAPTATION_TEMPLATE).content
     except FileNotFoundError:
-        planner = ""
+        try:
+            planner = registry.load("c", "planner.md").content
+        except FileNotFoundError:
+            planner = ""
     m = _manifest(job_id)
+    ws = BookWorkspace(BOOKS_ROOT, job_id)
+    adaptations = _load_adaptations(ws)
+    generated = "\n\n".join(
+        f"# ── {name} ──\n{a.get('block', '')}".rstrip()
+        for name, a in sorted(adaptations.items())
+        if a.get("block")
+    )
     return {
         "system_prompt": planner,
-        "user_prompt": "",
-        "generated_prompt": "",
+        "user_prompt": _profile_summary(ws),
+        "generated_prompt": generated,
         "prompt_version": m.prompt_version or "",
     }
 
@@ -519,6 +760,89 @@ async def confirm_prompt(job_id: str, body: dict[str, Any] | None = None) -> dic
     }
 
 
+@app.post("/api/jobs/{job_id}/adaptations/regenerate")
+async def regenerate_adaptations(job_id: str) -> dict[str, str]:
+    """重新生成每书适配块：删缓存 → 回退 plan → 后台重跑，回到确认门。"""
+    m = _manifest(job_id)
+    if m.status != BookStatus.WAITING_PLAN_CONFIRMATION:
+        raise HTTPException(400, "仅在待确认抽取方案时可重新生成适配块")
+    _guard_not_running(job_id)
+    ws = BookWorkspace(BOOKS_ROOT, job_id)
+    (ws.stage_dir("plan") / ADAPTATION_FILENAME).unlink(missing_ok=True)
+    _pipe().rewind(job_id, to_stage="plan")
+    _mark_running(job_id, "正在重新生成每书适配块（Model C）…")
+    _spawn(job_id, _bg_plan(job_id))
+    return {"status": "started", "stage": "generating_prompt"}
+
+
+@app.put("/api/jobs/{job_id}/adaptations")
+async def update_adaptations(job_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """人工编辑每书适配块（base 模板仍只读）。
+
+    保存后：重算 block version → 重写 plan 的 prompt_version（base+块合成 hash）
+    → 重算 manifest.prompt_version → 若已抽取则作废 extract 及下游记录。
+    """
+    m = _manifest(job_id)
+    _guard_not_running(job_id)
+    ws = BookWorkspace(BOOKS_ROOT, job_id)
+    adapt_path = ws.stage_dir("plan") / ADAPTATION_FILENAME
+    if not adapt_path.is_file():
+        raise HTTPException(400, "尚无适配块产物，请先生成抽取方案")
+    edits = {
+        str(e.get("template")): str(e.get("block") or "").strip()
+        for e in body.get("adaptations", [])
+        if e.get("template")
+    }
+    if not edits:
+        raise HTTPException(400, "未提供待保存的适配块")
+
+    data = load_artifact(adapt_path)
+    adaptations = data.get("adaptations") or {}
+    for tpl, block in edits.items():
+        if tpl not in adaptations:
+            raise HTTPException(400, f"未知模板的适配块: {tpl}")
+        adaptations[tpl]["block"] = block
+        adaptations[tpl]["version"] = adaptation_version(block) if block else ""
+        adaptations[tpl]["degraded"] = False
+        adaptations[tpl]["human_edited"] = True
+    header = ArtifactHeader.model_validate(data["header"])
+    header.extra["adapt_edited_at"] = datetime.now(timezone.utc).isoformat()
+    body = {k: v for k, v in data.items() if k != "header"}
+    body["adaptations"] = adaptations
+    save_artifact(adapt_path, header=header, data=body)
+
+    # 重算 plan 的 prompt_version（base + 适配块 合成 hash）
+    registry = BookAdaptedRegistry(
+        {t: a["block"] for t, a in adaptations.items() if a.get("block")},
+        prompts_root=PromptTemplateRegistry().prompts_root,
+    )
+    plan_path = ws.stage_artifact("plan")
+    plan_raw = load_artifact(plan_path)
+    plan_header = ArtifactHeader.model_validate(plan_raw["header"])
+    plan_body = {k: v for k, v in plan_raw.items() if k != "header"}
+    for sec in plan_body.get("sections", []):
+        tpl = sec.get("template")
+        if tpl and tpl in adaptations:
+            sec["prompt_version"] = registry.load("a", tpl).version
+    save_artifact(plan_path, header=plan_header, data=plan_body)
+
+    versions = sorted(
+        {s["prompt_version"] for s in plan_body.get("sections", []) if s.get("prompt_version")}
+    )
+    m.prompt_version = artifact_hash({"prompt_versions": versions})[:20] if versions else None
+    had_extract = "extract" in m.completed_stages()
+    # 先落盘再作废下游：invalidate_from 从磁盘重读 manifest，避免合成版本被旧状态覆盖
+    m.save(ws.book_dir)
+    if had_extract:
+        _pipe().invalidate_from(job_id, "extract")
+        m = _manifest(job_id)
+    return {
+        "saved": sorted(edits),
+        "prompt_version": m.prompt_version or "",
+        "invalidated_downstream": had_extract,
+    }
+
+
 # ── 路由：步骤 3 抽取（A）─────────────────────────────────────────────────────
 
 
@@ -548,11 +872,81 @@ async def get_compare(job_id: str) -> dict[str, Any]:
                 "content": str(b.get("content") or ""),
                 "chars": len(str(b.get("content") or "")),
                 "semantic_type": str(b.get("type") or "content"),
+                "page": (b.get("positions") or [{}])[0].get("anchor"),
+                "section_path": [*(b.get("parent_headings") or []), b.get("heading") or ""],
+                "asset_url": f"/api/jobs/{job_id}/assets/{b['blockid']}" if b.get("asset_path") else None,
             }
             for b in blocks
         ],
         "records": [r.model_dump(mode="json") for r in records],
     }
+
+
+@app.get("/api/jobs/{job_id}/assets/{block_id}")
+async def image_asset(job_id: str, block_id: str) -> FileResponse:
+    """Serve only image assets referenced by this book's parsed blocks."""
+    _manifest(job_id)
+    ws = BookWorkspace(BOOKS_ROOT, job_id)
+    blocks = load_blocks(ws.stage_dir("parse") / "blocks.jsonl")
+    block = next((b for b in blocks if b.get("blockid") == block_id), None)
+    if not block or not block.get("asset_path"):
+        raise HTTPException(404, "该内容块没有可查看的图片")
+    path = Path(block["asset_path"]).resolve()
+    if not path.is_relative_to(ws.book_dir.resolve()) or not path.is_file() or path.suffix.lower() not in {
+        ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff",
+    }:
+        raise HTTPException(404, "图片不存在或不属于当前文档")
+    return FileResponse(path, headers={"Cache-Control": "private, max-age=3600"})
+
+
+_WORKBENCH_ARTIFACTS = {
+    "extracted": ("extract", "04_extract/records.jsonl", "抽取记录", "全部初步抽取结果，包含待核验记录"),
+    "verified": ("verify", "06_verify/verified_records.jsonl", "核验记录", "包含核验与待复核标记的完整记录"),
+    "knowledge": ("knowledge", "08_publish/knowledge/records.jsonl", "结构化知识", "具有来源证据的结构化记录"),
+    "usable": ("knowledge", "08_publish/knowledge/usable_records.jsonl", "可用知识", "通过当前证据与核验门槛的记录"),
+    "evidence": ("knowledge", "08_publish/knowledge/evidence.jsonl", "原文证据", "原文片段、物理页码及定位信息"),
+    "visual": ("knowledge", "08_publish/knowledge/visual_facts.jsonl", "图片知识", "图中观察、步骤和关系及其核验状态"),
+    "assets": ("knowledge", "08_publish/knowledge/assets.jsonl", "图片索引", "原始图片的标识和相对路径"),
+    "quality": ("knowledge", "08_publish/knowledge/quality_report.json", "质量报告", "可用、隔离、覆盖和待审核情况"),
+    "quarantine": ("knowledge", "08_publish/knowledge/quarantine.jsonl", "隔离记录", "缺少证据或未通过确定性校验的记录"),
+}
+
+
+def _available_artifacts(job_id: str) -> list[dict[str, Any]]:
+    manifest = _manifest(job_id)
+    ws = BookWorkspace(BOOKS_ROOT, job_id)
+    done = manifest.completed_stages()
+    verified = ws.stage_artifact("verify")
+    files = []
+    for name, (stage, relative, label, description) in _WORKBENCH_ARTIFACTS.items():
+        path = ws.book_dir / relative
+        if not path.is_file():
+            continue
+        if stage == "knowledge":
+            if "verify" not in done or manifest.derived_artifacts_stale or not verified.is_file():
+                continue
+            if path.stat().st_mtime < verified.stat().st_mtime:
+                continue
+        elif stage not in done:
+            continue
+        files.append({"name": name, "filename": path.name, "label": label, "description": description,
+                      "bytes": path.stat().st_size, "url": f"/api/jobs/{job_id}/artifacts/{name}"})
+    return files
+
+
+@app.get("/api/jobs/{job_id}/artifacts")
+async def workbench_artifacts(job_id: str) -> dict[str, Any]:
+    return {"files": _available_artifacts(job_id)}
+
+
+@app.get("/api/jobs/{job_id}/artifacts/{name}")
+async def download_artifact(job_id: str, name: str) -> FileResponse:
+    if name not in _WORKBENCH_ARTIFACTS or name not in {a["name"] for a in _available_artifacts(job_id)}:
+        raise HTTPException(404, "文件尚未生成或已过期，请先完成相应处理阶段")
+    _, relative, _, _ = _WORKBENCH_ARTIFACTS[name]
+    path = BookWorkspace(BOOKS_ROOT, job_id).book_dir / relative
+    return FileResponse(path, filename=path.name,
+                        media_type="application/x-ndjson" if path.suffix == ".jsonl" else "application/json")
 
 
 # ── 路由：步骤 4 校验纠正（validate + verify）────────────────────────────────
@@ -580,16 +974,14 @@ async def get_verification(job_id: str) -> dict[str, Any]:
     report = load_artifact(report_path)
     issues = report.get("issues", [])
     correction_path = ws.stage_dir("verify") / "correction_log.jsonl"
-    corrections: list[CorrectionEntry] = []
+    corrections: list[dict[str, Any]] = []
     if correction_path.is_file():
         corrections = [
             c.model_dump(mode="json")
             for c in load_artifact_records(correction_path, CorrectionEntry)
         ]
     verify_path = ws.stage_artifact("verify")
-    records = (
-        load_artifact_records(verify_path, SourceRecord) if verify_path.is_file() else []
-    )
+    records = load_artifact_records(verify_path, SourceRecord) if verify_path.is_file() else []
     blocks_path = ws.stage_dir("parse") / "blocks.jsonl"
     chunks = (
         [
@@ -604,9 +996,7 @@ async def get_verification(job_id: str) -> dict[str, Any]:
         else []
     )
     record_ids = {r.record_id for r in records}
-    bad_ids = {i.get("record_id") for i in issues} | {
-        c["record_id"] for c in corrections
-    }
+    bad_ids = {i.get("record_id") for i in issues} | {c["record_id"] for c in corrections}
     total = len(records)
     applied = sum(1 for c in corrections if c.get("applied"))
     return {
@@ -630,9 +1020,7 @@ async def get_verification(job_id: str) -> dict[str, Any]:
 
 def _first_jsonl_line(path: Path) -> str:
     """读 jsonl 首个非空行（header 信封）。"""
-    return next(
-        (ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()), "{}"
-    )
+    return next((ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()), "{}")
 
 
 @app.post("/api/jobs/{job_id}/step/apply-corrections")
@@ -650,9 +1038,7 @@ async def apply_corrections(job_id: str) -> dict[str, Any]:
         raise HTTPException(400, "尚未执行校验")
     records = load_artifact_records(verify_path, SourceRecord)
     entries = (
-        load_artifact_records(correction_path, CorrectionEntry)
-        if correction_path.is_file()
-        else []
+        load_artifact_records(correction_path, CorrectionEntry) if correction_path.is_file() else []
     )
     by_id = {r.record_id: r for r in records}
     applied_now = failed = 0
@@ -662,14 +1048,9 @@ async def apply_corrections(job_id: str) -> dict[str, Any]:
         rec = by_id.get(c.record_id)
         if rec is None:
             continue
-        dump = rec.model_dump(mode="json")
-        if c.field == "(record)":
-            merged = {**dump, **(c.suggested if isinstance(c.suggested, dict) else {})}
-        else:
-            merged = {**dump, c.field: c.suggested}
         try:
-            by_id[c.record_id] = SourceRecord.model_validate(merged)
-        except ValidationError:
+            by_id[c.record_id] = apply_correction(rec, c)
+        except (ValidationError, ValueError):
             failed += 1
             continue
         c.applied = True
@@ -710,6 +1091,7 @@ def _export_excel(job_id: str) -> Path:
     ws = BookWorkspace(BOOKS_ROOT, job_id)
     script = project_paths.root / "scripts" / "export_book_review_excel.py"
     spec = importlib.util.spec_from_file_location("_tcm_export_excel", script)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     try:
         assert spec.loader is not None
@@ -726,19 +1108,11 @@ def _export_excel(job_id: str) -> Path:
 
 @app.post("/api/jobs/{job_id}/step/export")
 async def step_export(job_id: str) -> dict[str, Any]:
-    """导出 = 生成审核版 Excel + 放行人工审核门（WAITING_REVIEW → REVIEWED → PUBLISHED）。"""
+    """生成审核版 Excel；保持人工审核和发布状态。"""
     m = _manifest(job_id)
     if "verify" not in m.completed_stages():
         raise HTTPException(400, "请先完成校验")
     path = _export_excel(job_id)
-    ws = BookWorkspace(BOOKS_ROOT, job_id)
-    if m.status is BookStatus.WAITING_REVIEW:
-        m.transition(BookStatus.REVIEWED)
-        m.transition(BookStatus.PUBLISHED)
-        m.save(ws.book_dir)
-    elif m.status is BookStatus.REVIEWED:
-        m.transition(BookStatus.PUBLISHED)
-        m.save(ws.book_dir)
     return {
         "status": "done",
         "excel": path.name,
@@ -753,11 +1127,15 @@ async def step_export(job_id: str) -> dict[str, Any]:
 async def download(job_id: str) -> FileResponse:
     m = _manifest(job_id)
     ws = BookWorkspace(BOOKS_ROOT, job_id)
-    for stage in ("verify", "extract"):
+    stages = ("verify", "extract") if "verify" in m.completed_stages() and not m.derived_artifacts_stale else ("extract",)
+    for stage in stages:
+        if stage not in m.completed_stages():
+            continue
         artifact = ws.stage_artifact(stage)
         if artifact.is_file():
             return FileResponse(
-                artifact, filename=f"{m.book_id}_{stage}_records.jsonl",
+                artifact,
+                filename=f"{m.book_id}_{stage}_records.jsonl",
                 media_type="application/x-ndjson",
             )
     raise HTTPException(404, "尚无可导出的记录")
@@ -765,13 +1143,13 @@ async def download(job_id: str) -> FileResponse:
 
 @app.get("/api/download/{job_id}/excel")
 async def download_excel(job_id: str) -> FileResponse:
+    if _manifest(job_id).derived_artifacts_stale:
+        raise HTTPException(409, "旧审核表已过期，请重跑校验并重新导出")
     _manifest(job_id)
-    ws = BookWorkspace(BOOKS_ROOT, job_id)
-    review_dir = ws.stage_dir("review")
-    hits = sorted(review_dir.glob("*.xlsx")) if review_dir.is_dir() else []
-    path = hits[0] if hits else _export_excel(job_id)
+    path = _export_excel(job_id)  # Regenerate from current records; old files may predate a rerun.
     return FileResponse(
-        path, filename=path.name,
+        path,
+        filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -852,7 +1230,7 @@ async def workflow_op(job_id: str, operation: str) -> dict[str, Any]:
             m.save(ws.book_dir)
         return {"status": "back", "stage": _view_stage(m)}
     if operation.startswith("goto-"):
-        key = operation[len("goto-"):]
+        key = operation[len("goto-") :]
         _guard_not_running(job_id)
         target = _GOTO_STATUS.get(key)
         if target is None:
@@ -915,11 +1293,7 @@ def _resolve_run_dir(raw: str) -> Path:
 
 def _token_total(tokens: dict[str, Any]) -> int:
     return int(
-        sum(
-            v
-            for k, v in (tokens or {}).items()
-            if k.endswith("_input") or k.endswith("_output")
-        )
+        sum(v for k, v in (tokens or {}).items() if k.endswith("_input") or k.endswith("_output"))
     )
 
 
@@ -952,7 +1326,7 @@ def _scan_gepa_runs() -> list[dict[str, Any]]:
                 "total_generations": data.get("total_generations"),
                 "eval_calls": data.get("eval_calls"),
                 "elapsed_seconds": data.get("elapsed_seconds"),
-                "total_tokens": _token_total(data.get("tokens")),
+                "total_tokens": _token_total(data.get("tokens") or {}),
                 "best_constraint": str(data.get("best_constraint", "")).strip(),
             }
         )
@@ -987,9 +1361,7 @@ async def gepa_overview() -> dict[str, Any]:
         }
         for r in load_trend(ledger_path_for(root))
     ]
-    promoted_run_ids = {
-        t["run_id"] for t in trend if t["kind"] == "promote" and t["promoted"]
-    }
+    promoted_run_ids = {t["run_id"] for t in trend if t["kind"] == "promote" and t["promoted"]}
     for r in runs:
         r["promoted"] = r["run_id"] in promoted_run_ids
     summary = {

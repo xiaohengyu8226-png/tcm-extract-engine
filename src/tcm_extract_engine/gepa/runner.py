@@ -33,6 +33,7 @@ from tcm_extract_engine.core.artifacts import ArtifactHeader, load_artifact, sav
 from tcm_extract_engine.core.llm import UnifiedLLMClient
 from tcm_extract_engine.gepa.bridge import (
     evaluate_candidate,
+    fold_outcome_to_fitness,
     make_evaluate_fn,
     make_reflective_proposer,
 )
@@ -66,7 +67,7 @@ class TrendRecord:
     """飞轮台账的一条记录：一次 evolve 或 promote 的质量快照。"""
 
     ts: str
-    kind: str                       # evolve | promote
+    kind: str  # evolve | promote
     template: str
     book_ids: list[str] = field(default_factory=list)
     baseline_fitness: float | None = None
@@ -127,18 +128,47 @@ def _slice_book_artifacts(
     out_dir.mkdir(parents=True, exist_ok=True)
     plan = load_artifact(book_root / "03_plan/extraction_plan.json")
     sections = plan.get("sections", [])
-    if section_ids:
-        wanted = set(section_ids)
-        chosen = [s for s in sections if s.get("section_id") in wanted]
-    else:
-        chosen = [
-            s for s in sections
-            if s.get("template") == template and not s.get("skip_reason")
-        ]
-    if not chosen:
-        raise ValueError(
-            f"书中无使用模板 {template!r} 的可抽章节（book={book_root.name}）"
+    from tcm_extract_engine.cab.extractors import split_section_batches
+    from tcm_extract_engine.cab.planner import SectionPlan
+    from tcm_extract_engine.cab.profiler import load_blocks
+    from tcm_extract_engine.domains import get_domain_pack
+
+    manifest_path = book_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    domain_id = plan.get("domain_id", manifest.get("domain_id", "tcm"))
+    pack = get_domain_pack(domain_id)
+    blocks_by_id = {str(b["blockid"]): b for b in load_blocks(book_root / "01_parse/blocks.jsonl")}
+    wanted = set(section_ids) if section_ids is not None else None
+    chosen = []
+    for section in sections:
+        if section.get("skip_reason") or (
+            wanted is not None and section.get("section_id") not in wanted
+        ):
+            continue
+        batches = split_section_batches(
+            SectionPlan.model_validate(section), blocks_by_id, pack=pack
         )
+        matched = []
+        for batch in batches:
+            if batch.multimodal:
+                used_template = pack.figure_template
+            elif batch.passthrough:
+                extractor = ("TableKnowledgeExtractor" if pack.id == "general" else
+                             section.get("extractor") if section.get("extractor") in {"InteractionExtractor", "PregnancyRuleExtractor"}
+                             else "HerbTableExtractor")
+                used_template = pack.extractor_templates[extractor]
+            else:
+                used_template = section.get("template")
+            if used_template == template:
+                matched.append(batch)
+        if matched:
+            scoped = dict(section)
+            scoped["block_ids"] = list(
+                dict.fromkeys(bid for batch in matched for bid in batch.block_ids)
+            )
+            chosen.append(scoped)
+    if not chosen:
+        raise ValueError(f"书中无使用模板 {template!r} 的可抽章节（book={book_root.name}）")
 
     keep_blocks: set[str] = set()
     for sec in chosen:
@@ -163,15 +193,23 @@ def _slice_book_artifacts(
 
     sliced_plan = dict(plan)
     sliced_plan["sections"] = chosen
+    sliced_plan["domain_id"] = domain_id
+    from tcm_extract_engine.core.book import ADAPTATION_FILENAME
+    adaptation_path = book_root / "03_plan" / ADAPTATION_FILENAME
+    if adaptation_path.is_file():
+        adaptation_data = load_artifact(adaptation_path)
+        sliced_plan["book_adaptations"] = {name: data.get("block", "") for name, data in adaptation_data.get("adaptations", {}).items()}
+
     out_plan = out_dir / "extraction_plan.json"
-    out_plan.write_text(
-        json.dumps(sliced_plan, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    out_plan.write_text(json.dumps(sliced_plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
     book_id = plan["header"]["book_id"]
     logger.info(
         "[GEPARunner] 切片 book=%s template=%s sections=%d blocks=%d",
-        book_id, template, len(chosen), kept,
+        book_id,
+        template,
+        len(chosen),
+        kept,
     )
     return out_blocks, out_plan, book_id
 
@@ -217,6 +255,9 @@ async def evolve_template(
     verify_client: UnifiedLLMClient | None = None,
     reflect_client: UnifiedLLMClient | None = None,
     on_generation: Any = None,
+    vision_client: UnifiedLLMClient | None = None,
+    development_section_ids: list[str] | None = None,
+    holdout_section_ids: list[str] | None = None,
 ) -> EvolveResult:
     """对「一本书 × 一个 A 模板」跑小预算 GEPA 进化并落盘产物。
 
@@ -228,6 +269,23 @@ async def evolve_template(
     book_root = Path(books_root) / book_id
     if not book_root.is_dir():
         raise FileNotFoundError(f"书籍工作目录不存在: {book_root}")
+
+    source_plan = load_artifact(book_root / "03_plan/extraction_plan.json")
+    known = {s["section_id"]: s for s in source_plan.get("sections", [])}
+    development_ids = set(development_section_ids or [])
+    holdout_ids = set(holdout_section_ids or [])
+    reserved = development_ids | holdout_ids
+    optimization_ids = set(section_ids) if section_ids is not None else set(known) - reserved
+    partitions = [optimization_ids, development_ids, holdout_ids]
+    if any(ids - set(known) for ids in partitions):
+        raise ValueError("评测分区含未知 section_id")
+    if any(partitions[i] & partitions[j] for i in range(3) for j in range(i+1, 3)):
+        raise ValueError("优化、开发、保留分区不能重叠")
+    partition_blocks = [{b for sid in ids for b in known[sid].get("block_ids", [])} for ids in partitions]
+    if any(partition_blocks[i] & partition_blocks[j] for i in range(3) for j in range(i+1, 3)):
+        raise ValueError("评测分区的证据 block 不能重叠")
+    if section_ids is None and reserved:
+        section_ids = sorted(optimization_ids)
 
     run_id = f"{_now_tag()}_{hashlib.sha256(f'{book_id}:{template}'.encode()).hexdigest()[:6]}"
     run_dir = Path(out_root) / book_id / template / run_id
@@ -249,6 +307,14 @@ async def evolve_template(
         if reflect_client is None:
             reflect_client = UnifiedLLMClient(settings.prompt_llm)
             owned.append(reflect_client)
+    if vision_client is None:
+        from tcm_extract_engine.common.config import get_settings
+
+        vision_client = UnifiedLLMClient(get_settings().vision_llm)
+        owned.append(vision_client)
+    from tcm_extract_engine.core.usage import snapshot_usage, usage_delta
+    role_clients = {"extract": extract_client, "verify": verify_client, "vision": vision_client, "reflect": reflect_client}
+    usage_before = snapshot_usage(role_clients)
     evaluate_fn = make_evaluate_fn(
         book_id=real_book_id,
         blocks_path=blocks_path,
@@ -258,21 +324,24 @@ async def evolve_template(
         verify_client=verify_client,
         work_dir_root=cands_dir,
         verify_sample=verify_sample,
+        vision_client=vision_client,
     )
-    proposer = make_reflective_proposer(
-        llm_client=reflect_client, target_template=template
-    )
+    proposer = make_reflective_proposer(llm_client=reflect_client, target_template=template)
+    reserved_development = 2 if development_section_ids else 0
+    search_budget = budget - reserved_development
+    if search_budget < 2:
+        raise ValueError("需要至少两次优化评估；带开发集时总 budget 至少为 4")
     config = GEPAConfig(
         population_size=population,
         max_generations=generations,
         eval_sample_size=1,
-        convergence_threshold=1.5,          # 不可达：靠 budget 停，轨迹完整可观察
+        convergence_threshold=1.5,  # 不可达：靠 budget 停，轨迹完整可观察
         selection_strategy=selection_strategy,
-        crossover_rate=0.0,                 # 关闭交叉，专注反思变异
-        budget_metric_calls=budget,
+        crossover_rate=0.0,  # 关闭交叉，专注反思变异
+        budget_metric_calls=search_budget,
     )
     engine = GEPAEngine(
-        None,                               # 注入 evaluate_fn 后不使用内置网关
+        None,  # 注入 evaluate_fn 后不使用内置网关
         config,
         evaluate_fn=evaluate_fn,
         instruction_proposer=proposer,
@@ -288,6 +357,8 @@ async def evolve_template(
             on_generation(rep)
 
     try:
+        if budget < 1:
+            raise ValueError("GEPA budget 至少为 1")
         if with_baseline:
             # 复用 seed 候选缓存目录 → 与 gen0 的 seed 评估同一 work_dir，缓存命中
             seed_dir = cands_dir / f"cand_{seed.fingerprint()}"
@@ -301,13 +372,38 @@ async def evolve_template(
                 verify_client=verify_client,
                 work_dir=seed_dir,
                 verify_sample=verify_sample,
+                vision_client=vision_client,
             )
             baseline_fitness = base_outcome.fitness.fitness
+            engine._eval_calls = 1
+            engine._evaluation_cache[seed.fingerprint()] = fold_outcome_to_fitness(base_outcome)
         report = await engine.optimize(
             initial_individual=seed,
-            sample_chunks=[None],           # evaluate_fn 忽略 chunks
+            sample_chunks=[None],  # evaluate_fn 忽略 chunks
             on_generation=_collect,
         )
+        development_report: dict[str, Any] = {"status": "not_configured"}
+        development_calls = 0
+        if development_section_ids:
+            dev_blocks, dev_plan, _ = _slice_book_artifacts(book_root, template, development_section_ids, run_dir / "development_slice")
+            async def assess_dev(individual: PromptIndividual) -> Any:
+                nonlocal development_calls
+                development_calls += 1
+                return await evaluate_candidate(book_id=real_book_id, blocks_path=dev_blocks, plan_path=dev_plan,
+                    target_template=template, constraint_block=individual.extraction_prompt,
+                    extract_client=extract_client, verify_client=verify_client, vision_client=vision_client,
+                    work_dir=run_dir / "development_candidates" / individual.fingerprint(), verify_sample=verify_sample)
+            dev_seed = await assess_dev(seed)
+            winner = report.best_individual
+            dev_best = dev_seed if winner.fingerprint() == seed.fingerprint() else await assess_dev(winner)
+            accepted = dev_best.fitness.fitness >= dev_seed.fitness.fitness - 1e-9
+            development_report = {"status": "proxy_evaluated", "baseline": dev_seed.fitness.fitness,
+                                  "candidate": dev_best.fitness.fitness, "no_regression": accepted,
+                                  "metric_calls": development_calls}
+            if not accepted:
+                from dataclasses import replace
+                report = replace(report, best_individual=seed, final_fitness=baseline_fitness or 0.0)
+        engine._eval_calls += development_calls
     finally:
         for client in owned:
             await client.close()
@@ -320,17 +416,7 @@ async def evolve_template(
     best_path = run_dir / "best_constraint.md"
     best_path.write_text(best_block + "\n", encoding="utf-8")
 
-    tokens = {
-        "extract_input": extract_client.usage.input_tokens,
-        "extract_output": extract_client.usage.output_tokens,
-        "extract_calls": extract_client.usage.calls,
-        "verify_input": verify_client.usage.input_tokens,
-        "verify_output": verify_client.usage.output_tokens,
-        "verify_calls": verify_client.usage.calls,
-        "reflect_input": reflect_client.usage.input_tokens,
-        "reflect_output": reflect_client.usage.output_tokens,
-        "reflect_calls": reflect_client.usage.calls,
-    }
+    tokens = usage_delta(role_clients, usage_before)
     report_path = run_dir / "run.json"
     save_artifact(
         report_path,
@@ -347,6 +433,10 @@ async def evolve_template(
                 "budget_metric_calls": budget,
                 "verify_sample": verify_sample,
                 "selection_strategy": selection_strategy,
+                "search_budget": search_budget,
+                "optimization_section_ids": sorted(optimization_ids),
+                "development_section_ids": sorted(development_ids),
+                "holdout_section_ids": sorted(holdout_ids),
             },
         ),
         data={
@@ -355,6 +445,10 @@ async def evolve_template(
             "baseline_fitness": baseline_fitness,
             "best_fitness": report.final_fitness,
             "improved": improved,
+            "promotion_eligible": False,
+            "gold_status": "pending_human_confirmation",
+            "development": development_report,
+            "holdout": {"status": "not_run_pending_human_reference", "section_ids": holdout_section_ids or []},
             "fitness_history": report.fitness_history,
             "total_generations": report.total_generations,
             "eval_calls": engine._eval_calls,
@@ -377,7 +471,12 @@ async def evolve_template(
     )
     logger.info(
         "[GEPARunner] evolve 完成 book=%s template=%s run=%s baseline=%s best=%.4f improved=%s",
-        real_book_id, template, run_id, baseline_fitness, report.final_fitness, improved,
+        real_book_id,
+        template,
+        run_id,
+        baseline_fitness,
+        report.final_fitness,
+        improved,
     )
     append_trend(
         ledger_path_for(out_root),
@@ -499,7 +598,11 @@ def promote_constraint(
         path.write_text(new_content, encoding="utf-8")
         logger.info(
             "[GEPARunner] 晋升 template=%s version %s→%s reviewer=%s run=%s",
-            template, old_version, new_version, reviewer, run_id,
+            template,
+            old_version,
+            new_version,
+            reviewer,
+            run_id,
         )
         if ledger_path is not None:
             append_trend(

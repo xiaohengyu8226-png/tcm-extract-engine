@@ -262,3 +262,22 @@ class TestPromote:
         with pytest.raises(FileNotFoundError):
             promote_constraint(template="nope.md", constraint_block="x",
                                prompts_root=tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_evolution_rejects_partition_overlap_before_model_calls(tmp_path: Path) -> None:
+    books = tmp_path/'books'
+    _make_book(books)
+    with pytest.raises(ValueError, match='不能重叠'):
+        await evolve_template(book_id=BOOK_ID, template='general_rule.md', books_root=books,
+            out_root=tmp_path/'out', section_ids=['s1'], development_section_ids=['s1'])
+
+
+@pytest.mark.asyncio
+async def test_default_optimization_excludes_reserved_sections(tmp_path: Path) -> None:
+    books = tmp_path/'books'
+    _make_book(books)
+    # s1 is the only eligible section. Reserving it leaves no optimization data.
+    with pytest.raises(ValueError, match='无使用模板'):
+        await evolve_template(book_id=BOOK_ID, template='general_rule.md', books_root=books,
+            out_root=tmp_path/'out', holdout_section_ids=['s1'])

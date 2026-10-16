@@ -53,6 +53,12 @@ STAGE_ARTIFACTS: dict[str, str] = {
 
 _BOOK_ID_RE = re.compile(r"^[a-z0-9]{12}$")
 
+# 每书适配块产物（落 03_plan/ 同级，非 stage artifact，不进 STAGE_ARTIFACTS）
+ADAPTATION_FILENAME = "prompt_adaptations.json"
+
+# 每书 goal 归纳产物（同落 03_plan/，按 profile_hash 缓存；非 stage artifact）
+GOAL_FILENAME = "book_goal.json"
+
 
 class BookWorkspace:
     """单本书的工作目录 + manifest 操作封装。"""
@@ -85,8 +91,13 @@ class BookWorkspace:
     # ── manifest 生命周期 ───────────────────────────────────────────────────
 
     @classmethod
-    def create(cls, books_root: Path, pdf_path: Path) -> BookWorkspace:
+    def create(
+        cls, books_root: Path, pdf_path: Path, *, domain_id: str = "general"
+    ) -> BookWorkspace:
         """为新 PDF 建立工作目录 + 初始 manifest（幂等：同 hash 复用）。"""
+        from tcm_extract_engine.domains import get_domain_pack
+
+        get_domain_pack(domain_id)
         file_hash = sha256_file(pdf_path)
         book_id = file_hash.removeprefix("sha256:")[:12]
 
@@ -94,6 +105,10 @@ class BookWorkspace:
         existing = ws.read_manifest()
         if existing is not None:
             if existing.file_hash == file_hash:
+                if existing.domain_id != domain_id:
+                    raise ValueError(
+                        f"书籍已有领域 {existing.domain_id}，请求 {domain_id}；请显式切包后从 profile 重跑"
+                    )
                 logger.info("[Book %s] 已存在（hash 相同），复用", book_id)
                 return ws
             raise ValueError(f"book_id 冲突: {book_id} hash 不一致")
@@ -105,6 +120,7 @@ class BookWorkspace:
         # 源文件引用（复制小型 PDF；复制失败时退化为记录原始路径）
         manifest = BookManifest(
             book_id=book_id,
+            domain_id=domain_id,
             file_name=pdf_path.name,
             file_hash=file_hash,
             file_size=pdf_path.stat().st_size,
